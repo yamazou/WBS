@@ -1,0 +1,33 @@
+:root {
+  font-family: 'Meiryo UI', Meiryo, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  line-height: 1.45;
+  color: #111827;
+  background: #ffffff;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+body {
+  margin: 0;
+  font-family: 'Meiryo UI', Meiryo, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+#root {
+  min-height: 100vh;
+  padding: 8px;
+  display: flex;
+  justify-content: center;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
