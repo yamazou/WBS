@@ -5,7 +5,12 @@ import {
   emptyProjectBundle,
   initialTasks,
   NEW_PROJECT_DEFAULT_TASKS,
+  type IssueItem,
+  type MomDocument,
+  type MomHeader,
+  type MomItem,
   type ProjectBundle,
+  type SystemOverviewItem,
   type Task,
   type TaskStatus,
   type ZoomUnit,
@@ -50,7 +55,7 @@ const ganttCalendarMonthShort = new Intl.DateTimeFormat('en-US', { month: 'short
 
 function getStatusClass(status: TaskStatus): string {
   if (status === 'Finished') return 'status-finished'
-  if (status === 'On process') return 'status-process'
+  if (status === 'In Process') return 'status-process'
   return 'status-not-started'
 }
 
@@ -65,7 +70,7 @@ function getRoleClass(role: string): string {
 function statusFromProgress(progress: number): TaskStatus {
   if (progress <= 0) return 'Not Started'
   if (progress >= 100) return 'Finished'
-  return 'On process'
+  return 'In Process'
 }
 
 function normalizeRole(role: unknown): string {
@@ -139,6 +144,145 @@ function getPlannedEndBadgeClass(value: string): string {
   return 'planned-end-past'
 }
 
+function makeEmptyIssue(nextId: number): IssueItem {
+  return {
+    id: nextId,
+    status: '',
+    type: '',
+    issued_by: '',
+    issue: '',
+    due_date: '',
+    pic: '',
+    created_on: '',
+    updated_on: '',
+    progress: '',
+  }
+}
+
+function makeEmptySystemOverview(nextId: number): SystemOverviewItem {
+  return {
+    id: nextId,
+    title: '',
+    image_data_url: '',
+    description: '',
+  }
+}
+
+function makeEmptyMomItem(nextId: number): MomItem {
+  return {
+    id: nextId,
+    type: '',
+    content: '',
+    issue_list_no: '',
+    pic: '',
+    due_date: '',
+    remarks: '',
+  }
+}
+
+function sortedDistinctIssueIsoDates(issues: IssueItem[], key: 'created_on' | 'due_date'): string[] {
+  const set = new Set<string>()
+  for (const item of issues) {
+    const v = item[key].trim()
+    if (v) set.add(v)
+  }
+  return Array.from(set).sort((a, b) => {
+    const ta = parseTaskDate(a)
+    const tb = parseTaskDate(b)
+    if (ta === null && tb === null) return a.localeCompare(b)
+    if (ta === null) return 1
+    if (tb === null) return -1
+    return ta - tb
+  })
+}
+
+/** Multiline fields: row height follows content. Re-syncs when tab leaves `display:none` (ResizeObserver) and after layout (rAF). */
+function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'rows'>) {
+  const { className, onChange, value, ...rest } = props
+  const ref = useRef<HTMLTextAreaElement>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    let cancelled = false
+    const sync = () => {
+      if (cancelled || !el.isConnected) return
+      el.style.height = 'auto'
+      el.style.height = `${el.scrollHeight}px`
+    }
+    sync()
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        sync()
+      })
+    })
+    const ro = new ResizeObserver(() => {
+      requestAnimationFrame(sync)
+    })
+    ro.observe(el)
+    return () => {
+      cancelled = true
+      ro.disconnect()
+    }
+  }, [value])
+  return (
+    <textarea
+      ref={ref}
+      rows={1}
+      className={className}
+      value={value}
+      onChange={onChange}
+      {...rest}
+    />
+  )
+}
+
+function TabHeaderProjectPickers({
+  projectName,
+  onProjectNameChange,
+  companyFilter,
+  onCompanyFilterChange,
+  filteredProjectNames,
+  distinctCompaniesForFilter,
+}: {
+  projectName: string
+  onProjectNameChange: (name: string) => void
+  companyFilter: string
+  onCompanyFilterChange: (filter: string) => void
+  filteredProjectNames: string[]
+  distinctCompaniesForFilter: string[]
+}) {
+  return (
+    <div className="tab-header-project-controls" role="group" aria-label="Project and company filter">
+      <label className="tab-header-project-controls__project">
+        <span className="tab-header-project-controls__label">Project</span>
+        <select value={projectName} onChange={(e) => onProjectNameChange(e.target.value)}>
+          <option value="">プロジェクトを選択…</option>
+          {filteredProjectNames.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="tab-header-project-controls__company">
+        <span className="tab-header-project-controls__label">会社で絞り込み</span>
+        <select
+          value={companyFilter}
+          onChange={(e) => onCompanyFilterChange(e.target.value)}
+          aria-label="会社で絞り込み"
+        >
+          <option value="">ALL</option>
+          {distinctCompaniesForFilter.map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+      </label>
+    </div>
+  )
+}
+
 const toStartOfDay = (value: number) => {
   const date = new Date(value)
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
@@ -187,10 +331,14 @@ function parseTasksJson(saved: string | null): Task[] {
         actual_start_date: String((task as Partial<Task>).actual_start_date ?? ''),
         actual_end_date: String((task as Partial<Task>).actual_end_date ?? ''),
         role: normalizeRole(task.role),
-        status:
-          task.status === 'Finished' || task.status === 'On process' || task.status === 'Not Started'
-            ? task.status
-            : 'Not Started',
+        status: (() => {
+          const rawStatus = String((task as { status?: unknown }).status ?? '')
+          if (rawStatus === 'Finished' || rawStatus === 'Not Started' || rawStatus === 'In Process') {
+            return rawStatus as TaskStatus
+          }
+          if (rawStatus === 'On process') return 'In Process'
+          return 'Not Started'
+        })(),
         progress: Number(task.progress ?? 0),
         mh_md: String((task as Partial<Task>).mh_md ?? ''),
       }))
@@ -225,12 +373,25 @@ function App() {
   )
   const wbsScrollRef = useRef<HTMLDivElement | null>(null)
   const ganttScrollRef = useRef<HTMLDivElement | null>(null)
+  const issueScrollRef = useRef<HTMLDivElement | null>(null)
   const syncingScrollRef = useRef(false)
   const tasksBelongToProjectRef = useRef(mountSnapshot.selectedProjectName)
   const [wbsScrollLeft, setWbsScrollLeft] = useState(0)
   const [wbsScrollMax, setWbsScrollMax] = useState(0)
   const [ganttScrollLeft, setGanttScrollLeft] = useState(0)
   const [ganttScrollMax, setGanttScrollMax] = useState(0)
+  const [issueScrollLeft, setIssueScrollLeft] = useState(0)
+  const [issueScrollMax, setIssueScrollMax] = useState(0)
+  const [activeMenu, setActiveMenu] = useState<'wbs' | 'issues' | 'mom' | 'system_overview'>('wbs')
+  const [issueStatusFilter, setIssueStatusFilter] = useState('')
+  const [issueTypeFilter, setIssueTypeFilter] = useState('')
+  const [issueSubmitterFilter, setIssueSubmitterFilter] = useState('')
+  const [issueCreatedFilter, setIssueCreatedFilter] = useState('')
+  const [issueDueDateFilter, setIssueDueDateFilter] = useState('')
+  const [issuePicFilter, setIssuePicFilter] = useState('')
+  const [issueDateSort, setIssueDateSort] = useState<{ key: 'created_on' | 'due_date'; dir: 'asc' | 'desc' } | null>(null)
+  const [overviewImageZoomById, setOverviewImageZoomById] = useState<Record<number, number>>({})
+  const [selectedMomIdByProject, setSelectedMomIdByProject] = useState<Record<string, number | null>>({})
   const [zoom, setZoom] = useState<ZoomUnit>(() => {
     try {
       const savedZoom = localStorage.getItem(ZOOM_STORAGE_KEY)
@@ -360,6 +521,16 @@ function App() {
   }, [projectName, projects[projectName]?.company, companyUnlockPending])
 
   useEffect(() => {
+    setIssueDateSort(null)
+    setIssueStatusFilter('')
+    setIssueTypeFilter('')
+    setIssueSubmitterFilter('')
+    setIssueCreatedFilter('')
+    setIssueDueDateFilter('')
+    setIssuePicFilter('')
+  }, [projectName])
+
+  useEffect(() => {
     if (!projectName) {
       setTasks([])
       tasksBelongToProjectRef.current = ''
@@ -432,9 +603,9 @@ function App() {
       const average = Math.round(
         effectiveChildren.reduce((sum, child) => sum + child.progress, 0) / effectiveChildren.length,
       )
-      const hasProcess = effectiveChildren.some((child) => child.status === 'On process')
+      const hasProcess = effectiveChildren.some((child) => child.status === 'In Process')
       const hasNotStarted = effectiveChildren.some((child) => child.status === 'Not Started')
-      const status: TaskStatus = average >= 100 ? 'Finished' : hasProcess || !hasNotStarted ? 'On process' : 'Not Started'
+      const status: TaskStatus = average >= 100 ? 'Finished' : hasProcess || !hasNotStarted ? 'In Process' : 'Not Started'
       const sumMhMd = effectiveChildren.reduce((sum, child) => sum + parseMhMdNumeric(child.mh_md ?? ''), 0)
       const mhMdUnit = rollupMhMdUnit(effectiveChildren)
 
@@ -475,7 +646,7 @@ function App() {
     const poLabel = formatPoDateForHeader(b?.po_date ?? '')
     const parts = [projectName]
     if (company) parts.push(company)
-    if (poLabel) parts.push(poLabel)
+    if (poLabel) parts.push(`PO on ${poLabel}`)
     return parts.join(' | ')
   }, [projectName, projects])
 
@@ -494,18 +665,12 @@ function App() {
     [projects],
   )
 
-  /** 会社で絞り込んだうえでの Project 一覧（未指定なら全件）。選択中のみフィルター外でも一覧に残す。 */
+  /** 会社で絞り込んだうえでの Project 一覧（未指定なら全件）。フィルターに合わない選択は useLayoutEffect で先頭へ切り替え。 */
   const filteredProjectNames = useMemo(() => {
     const cf = companyFilter.trim()
-    const base = !cf
-      ? [...allProjectNames]
-      : allProjectNames.filter((name) => (projects[name]?.company ?? '').trim() === cf)
-    if (projectName && projects[projectName] && !base.includes(projectName)) {
-      base.push(projectName)
-      base.sort((a, b) => a.localeCompare(b))
-    }
-    return base
-  }, [allProjectNames, companyFilter, projects, projectName])
+    if (!cf) return [...allProjectNames]
+    return allProjectNames.filter((name) => (projects[name]?.company ?? '').trim() === cf)
+  }, [allProjectNames, companyFilter, projects])
 
   useLayoutEffect(() => {
     if (!projectName) return
@@ -579,6 +744,7 @@ function App() {
     const syncScrollMeta = () => {
       const wbsEl = wbsScrollRef.current
       const ganttEl = ganttScrollRef.current
+      const issueEl = issueScrollRef.current
       if (wbsEl) {
         setWbsScrollLeft(wbsEl.scrollLeft)
         setWbsScrollMax(Math.max(0, wbsEl.scrollWidth - wbsEl.clientWidth))
@@ -586,6 +752,10 @@ function App() {
       if (ganttEl) {
         setGanttScrollLeft(ganttEl.scrollLeft)
         setGanttScrollMax(Math.max(0, ganttEl.scrollWidth - ganttEl.clientWidth))
+      }
+      if (issueEl) {
+        setIssueScrollLeft(issueEl.scrollLeft)
+        setIssueScrollMax(Math.max(0, issueEl.scrollWidth - issueEl.clientWidth))
       }
     }
 
@@ -595,7 +765,7 @@ function App() {
       cancelAnimationFrame(rafId)
       window.removeEventListener('resize', syncScrollMeta)
     }
-  }, [tasks, zoom, timelineContentWidth])
+  }, [activeMenu, projectName, projects, tasks, zoom, timelineContentWidth])
 
   const timelineTicks = useMemo(() => {
     if (zoom === 'day') {
@@ -949,6 +1119,13 @@ function App() {
 
   const deleteCompanyForProject = () => {
     if (!projectName) return
+    const currentCompany = (projects[projectName]?.company ?? '').trim()
+    const ok = window.confirm(
+      currentCompany
+        ? `Delete company "${currentCompany}" from project "${projectName}"?`
+        : `Delete company setting from project "${projectName}"?`,
+    )
+    if (!ok) return
     setCompanyUnlockPending(false)
     updateCompany('')
     setCompanyRenameInput('')
@@ -983,6 +1160,13 @@ function App() {
       tasks: bundle.tasks.map((task) => ({ ...task })),
       company: bundle.company,
       po_date: bundle.po_date ?? '',
+      issues: (bundle.issues ?? []).map((item) => ({ ...item })),
+      system_overview: (bundle.system_overview ?? []).map((item) => ({ ...item })),
+      mom_documents: (bundle.mom_documents ?? []).map((doc) => ({
+        id: doc.id,
+        header: { ...doc.header },
+        items: (doc.items ?? []).map((item) => ({ ...item })),
+      })),
     }
     tasksBelongToProjectRef.current = trimmed
     setProjects(next)
@@ -1002,6 +1186,8 @@ function App() {
 
   const deleteProject = () => {
     if (!projectName || !projects[projectName]) return
+    const ok = window.confirm(`Delete project "${projectName}"?`)
+    if (!ok) return
     const names = Object.keys(projects)
     const nextProjects = { ...projects }
     delete nextProjects[projectName]
@@ -1102,7 +1288,148 @@ function App() {
   }
 
   const exportExcel = async () => {
-    if (!projectName || !tasks.length) return
+    if (!projectName) return
+    if (activeMenu === 'wbs' && !tasks.length) return
+    const ExcelJS = (await import('exceljs')).default
+
+    if (activeMenu === 'system_overview') {
+      const workbook = new ExcelJS.Workbook()
+      const sheet = workbook.addWorksheet('Overview')
+      const overviewHeaders = ['No', 'Title', 'Image', 'Description']
+      sheet.addRow(overviewHeaders)
+
+      const items = activeSystemOverviewItems
+      items.forEach((item, idx) => {
+        const rowNumber = sheet.rowCount + 1
+        sheet.addRow([idx + 1, item.title, '', item.description])
+
+        if (item.image_data_url) {
+          const mimeMatch = /^data:(image\/[a-zA-Z0-9+.-]+);base64,/.exec(item.image_data_url)
+          const mime = mimeMatch?.[1]?.toLowerCase() ?? ''
+          const extension =
+            mime === 'image/png'
+              ? 'png'
+              : mime === 'image/jpeg' || mime === 'image/jpg'
+                ? 'jpeg'
+                : mime === 'image/gif'
+                  ? 'gif'
+                  : undefined
+          if (extension) {
+            const imageId = workbook.addImage({
+              base64: item.image_data_url,
+              extension,
+            })
+            sheet.addImage(imageId, {
+              tl: { col: 2 + 0.1, row: rowNumber - 1 + 0.1 },
+              ext: { width: 360, height: 200 },
+            })
+            sheet.getRow(rowNumber).height = 150
+          }
+        }
+      })
+
+      const totalRows = sheet.rowCount
+      const totalCols = overviewHeaders.length
+      for (let r = 1; r <= totalRows; r += 1) {
+        for (let c = 1; c <= totalCols; c += 1) {
+          const cell = sheet.getCell(r, c)
+          cell.font = { name: 'Meiryo UI', size: 10 }
+          cell.alignment = { vertical: 'top', horizontal: c === 4 ? 'left' : 'center', wrapText: true }
+          cell.border = {
+            top: { style: 'thin', color: { argb: 'FF4B5563' } },
+            left: { style: 'thin', color: { argb: 'FF4B5563' } },
+            bottom: { style: 'thin', color: { argb: 'FF4B5563' } },
+            right: { style: 'thin', color: { argb: 'FF4B5563' } },
+          }
+        }
+      }
+
+      if (totalRows >= 1) {
+        const headerRow = sheet.getRow(1)
+        headerRow.font = { name: 'Meiryo UI', size: 10, bold: true }
+        headerRow.height = 22
+      }
+
+      sheet.columns = [{ width: 6 }, { width: 28 }, { width: 52 }, { width: 52 }]
+
+      const buffer = await workbook.xlsx.writeBuffer()
+      const blob = new Blob([buffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = 'overview-export.xlsx'
+      anchor.click()
+      URL.revokeObjectURL(url)
+      return
+    }
+
+    if (activeMenu === 'issues') {
+      const workbook = new ExcelJS.Workbook()
+      const sheet = workbook.addWorksheet('Issue_List')
+      const issueHeaders = ['No', 'Created', 'Status', 'Type', 'Submit', 'Issue', 'Due Date', 'PIC', 'Progress']
+      sheet.addRow(issueHeaders)
+
+      sortedFilteredIssues.forEach((item, idx) => {
+        sheet.addRow([
+          idx + 1,
+          item.created_on,
+          item.status,
+          item.type,
+          item.issued_by,
+          item.issue,
+          item.due_date,
+          item.pic,
+          item.progress,
+        ])
+      })
+
+      const totalRows = sheet.rowCount
+      const totalCols = issueHeaders.length
+      for (let r = 1; r <= totalRows; r += 1) {
+        for (let c = 1; c <= totalCols; c += 1) {
+          const cell = sheet.getCell(r, c)
+          cell.font = { name: 'Meiryo UI', size: 10 }
+          cell.alignment = { vertical: 'middle', horizontal: c === 6 || c === 9 ? 'left' : 'center', wrapText: true }
+          cell.border = {
+            top: { style: 'thin', color: { argb: 'FF4B5563' } },
+            left: { style: 'thin', color: { argb: 'FF4B5563' } },
+            bottom: { style: 'thin', color: { argb: 'FF4B5563' } },
+            right: { style: 'thin', color: { argb: 'FF4B5563' } },
+          }
+        }
+      }
+
+      if (totalRows >= 1) {
+        const headerRow = sheet.getRow(1)
+        headerRow.font = { name: 'Meiryo UI', size: 10, bold: true }
+      }
+      sheet.columns = [
+        { width: 6 },
+        { width: 14 },
+        { width: 14 },
+        { width: 14 },
+        { width: 14 },
+        { width: 40 },
+        { width: 14 },
+        { width: 14 },
+        { width: 24 },
+      ]
+
+      const buffer = await workbook.xlsx.writeBuffer()
+      const blob = new Blob([buffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = 'issue-list-export.xlsx'
+      anchor.click()
+      URL.revokeObjectURL(url)
+      return
+    }
+
     const wbsRows = taskRows.map(({ task, depth }) => {
       const effectiveTask = effectiveTaskMap.get(task.id) ?? task
       return {
@@ -1206,7 +1533,6 @@ function App() {
       ])
     }
 
-    const ExcelJS = (await import('exceljs')).default
     const workbook = new ExcelJS.Workbook()
     const sheet = workbook.addWorksheet('WBS_Gantt')
 
@@ -1268,6 +1594,248 @@ function App() {
   const companyRenameDisabled = !projectName || (!hasCompanyOnProject && !companyUnlockPending)
   const companyAddDisabled = !projectName || hasCompanyOnProject
   const companyDeleteDisabled = !projectName || (!hasCompanyOnProject && !companyUnlockPending)
+  const activeIssues = projects[projectName]?.issues ?? []
+  const issueTypeOptions = useMemo(
+    () =>
+      Array.from(new Set(activeIssues.map((item) => item.type.trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [activeIssues],
+  )
+  const issueSubmitterOptions = useMemo(
+    () =>
+      Array.from(new Set(activeIssues.map((item) => item.issued_by.trim()).filter(Boolean))).sort((a, b) =>
+        a.localeCompare(b),
+      ),
+    [activeIssues],
+  )
+  const issueCreatedOptions = useMemo(() => sortedDistinctIssueIsoDates(activeIssues, 'created_on'), [activeIssues])
+  const issueDueDateOptions = useMemo(() => sortedDistinctIssueIsoDates(activeIssues, 'due_date'), [activeIssues])
+  const issuePicOptions = useMemo(
+    () => Array.from(new Set(activeIssues.map((item) => item.pic.trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b)),
+    [activeIssues],
+  )
+  const filteredIssues = useMemo(
+    () =>
+      activeIssues.filter((item) => {
+        if (issueStatusFilter && item.status !== issueStatusFilter) return false
+        if (issueTypeFilter && item.type.trim() !== issueTypeFilter) return false
+        if (issueSubmitterFilter && item.issued_by.trim() !== issueSubmitterFilter) return false
+        if (issueCreatedFilter && item.created_on.trim() !== issueCreatedFilter) return false
+        if (issueDueDateFilter && item.due_date.trim() !== issueDueDateFilter) return false
+        if (issuePicFilter && item.pic.trim() !== issuePicFilter) return false
+        return true
+      }),
+    [
+      activeIssues,
+      issueCreatedFilter,
+      issueDueDateFilter,
+      issuePicFilter,
+      issueStatusFilter,
+      issueSubmitterFilter,
+      issueTypeFilter,
+    ],
+  )
+
+  const sortedFilteredIssues = useMemo(() => {
+    if (!issueDateSort) return filteredIssues
+    const { key, dir } = issueDateSort
+    const mult = dir === 'asc' ? 1 : -1
+    return [...filteredIssues].sort((a, b) => {
+      const ta = parseTaskDate(a[key].trim())
+      const tb = parseTaskDate(b[key].trim())
+      const emptyA = ta === null
+      const emptyB = tb === null
+      if (emptyA && emptyB) return a.id - b.id
+      if (emptyA) return 1
+      if (emptyB) return -1
+      const diff = (ta - tb) * mult
+      if (diff !== 0) return diff
+      return a.id - b.id
+    })
+  }, [filteredIssues, issueDateSort])
+
+  const toggleIssueDateSort = (key: 'created_on' | 'due_date') => {
+    setIssueDateSort((prev) => {
+      if (prev?.key === key) return { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' }
+      return { key, dir: 'asc' }
+    })
+  }
+
+  const updateProjectIssues = (updater: (current: IssueItem[]) => IssueItem[]) => {
+    if (!projectName) return
+    setProjects((current) => {
+      const bundle = current[projectName] ?? emptyProjectBundle(tasksRef.current.map((task) => ({ ...task })))
+      const nextIssues = updater(bundle.issues ?? [])
+      return { ...current, [projectName]: { ...bundle, issues: nextIssues } }
+    })
+  }
+
+  const updateProjectSystemOverview = (updater: (current: SystemOverviewItem[]) => SystemOverviewItem[]) => {
+    if (!projectName) return
+    setProjects((current) => {
+      const bundle = current[projectName] ?? emptyProjectBundle(tasksRef.current.map((task) => ({ ...task })))
+      const nextItems = updater(bundle.system_overview ?? [])
+      return { ...current, [projectName]: { ...bundle, system_overview: nextItems } }
+    })
+  }
+
+  const addIssueRow = () => {
+    updateProjectIssues((current) => {
+      const nextId = current.reduce((max, item) => Math.max(max, item.id), 0) + 1
+      return [...current, makeEmptyIssue(nextId)]
+    })
+  }
+
+  const activeSystemOverviewItems = projects[projectName]?.system_overview ?? []
+  const addSystemOverviewItem = () => {
+    updateProjectSystemOverview((current) => {
+      const nextId = current.reduce((max, item) => Math.max(max, item.id), 0) + 1
+      return [...current, makeEmptySystemOverview(nextId)]
+    })
+  }
+  const updateSystemOverviewItem = <K extends keyof SystemOverviewItem>(
+    itemId: number,
+    key: K,
+    value: SystemOverviewItem[K],
+  ) => {
+    updateProjectSystemOverview((current) => current.map((item) => (item.id === itemId ? { ...item, [key]: value } : item)))
+  }
+  const removeSystemOverviewItem = (itemId: number) => {
+    const ok = window.confirm('Delete this System Overview item?')
+    if (!ok) return
+    updateProjectSystemOverview((current) => current.filter((item) => item.id !== itemId))
+  }
+  const moveSystemOverviewItem = (itemId: number, direction: 'up' | 'down') => {
+    updateProjectSystemOverview((current) => {
+      const index = current.findIndex((item) => item.id === itemId)
+      if (index < 0) return current
+      const swapIndex = direction === 'up' ? index - 1 : index + 1
+      if (swapIndex < 0 || swapIndex >= current.length) return current
+      const next = [...current]
+      const temp = next[index]
+      next[index] = next[swapIndex]
+      next[swapIndex] = temp
+      return next
+    })
+  }
+
+  const handleSystemOverviewImageSelect = (itemId: number, file: File | null) => {
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : ''
+      updateSystemOverviewItem(itemId, 'image_data_url', dataUrl)
+    }
+    reader.readAsDataURL(file)
+  }
+
+  const updateIssue = <K extends keyof IssueItem>(issueId: number, key: K, value: IssueItem[K]) => {
+    updateProjectIssues((current) => current.map((item) => (item.id === issueId ? { ...item, [key]: value } : item)))
+  }
+
+  const removeIssue = (issueId: number) => {
+    const target = activeIssues.find((item) => item.id === issueId)
+    const ok = window.confirm(`Delete issue #${target ? activeIssues.indexOf(target) + 1 : issueId}?`)
+    if (!ok) return
+    updateProjectIssues((current) => current.filter((item) => item.id !== issueId))
+  }
+
+  const momDocs: MomDocument[] = projects[projectName]?.mom_documents ?? []
+  const selectedMomId = projectName ? (selectedMomIdByProject[projectName] ?? null) : null
+  const activeMomDoc = (() => {
+    if (!momDocs.length) return null
+    if (selectedMomId !== null) {
+      const hit = momDocs.find((doc) => doc.id === selectedMomId)
+      if (hit) return hit
+    }
+    return momDocs[0]
+  })()
+  const activeMomHeader: MomHeader = activeMomDoc?.header ?? { title: '', date: '', time: '', attendance: '', location: '' }
+  const activeMomItems: MomItem[] = activeMomDoc?.items ?? []
+
+  useEffect(() => {
+    if (!projectName) return
+    if (!momDocs.length) {
+      setSelectedMomIdByProject((current) => ({ ...current, [projectName]: null }))
+      return
+    }
+    const currentSelected = selectedMomIdByProject[projectName]
+    if (currentSelected !== null && currentSelected !== undefined && momDocs.some((doc) => doc.id === currentSelected)) return
+    setSelectedMomIdByProject((current) => ({ ...current, [projectName]: momDocs[0].id }))
+  }, [momDocs, projectName, selectedMomIdByProject])
+
+  const updateProjectMomDocs = (updater: (current: MomDocument[]) => MomDocument[]) => {
+    if (!projectName) return
+    setProjects((current) => {
+      const bundle = current[projectName] ?? emptyProjectBundle(tasksRef.current.map((task) => ({ ...task })))
+      const nextDocs = updater(bundle.mom_documents ?? [])
+      return { ...current, [projectName]: { ...bundle, mom_documents: nextDocs } }
+    })
+  }
+  const newMom = () => {
+    if (!projectName) return
+    updateProjectMomDocs((current) => {
+      const nextId = current.reduce((max, doc) => Math.max(max, doc.id), 0) + 1
+      const doc: MomDocument = {
+        id: nextId,
+        header: { title: '', date: '', time: '', attendance: '', location: '' },
+        items: [],
+      }
+      return [doc, ...current]
+    })
+    setSelectedMomIdByProject((current) => {
+      const maxId = (momDocs.length ? Math.max(...momDocs.map((doc) => doc.id)) : 0) + 1
+      return { ...current, [projectName]: maxId }
+    })
+  }
+  const updateProjectMomHeader = <K extends keyof MomHeader>(key: K, value: MomHeader[K]) => {
+    if (!activeMomDoc) return
+    updateProjectMomDocs((current) =>
+      current.map((doc) => (doc.id === activeMomDoc.id ? { ...doc, header: { ...doc.header, [key]: value } } : doc)),
+    )
+  }
+  const updateProjectMomItems = (updater: (current: MomItem[]) => MomItem[]) => {
+    if (!activeMomDoc) return
+    updateProjectMomDocs((current) =>
+      current.map((doc) => (doc.id === activeMomDoc.id ? { ...doc, items: updater(doc.items ?? []) } : doc)),
+    )
+  }
+  const addMomRow = () => {
+    updateProjectMomItems((current) => {
+      const nextId = current.reduce((max, item) => Math.max(max, item.id), 0) + 1
+      return [...current, makeEmptyMomItem(nextId)]
+    })
+  }
+  const updateMomItem = <K extends keyof MomItem>(itemId: number, key: K, value: MomItem[K]) => {
+    updateProjectMomItems((current) => current.map((item) => (item.id === itemId ? { ...item, [key]: value } : item)))
+  }
+  const removeMomItem = (itemId: number) => {
+    const ok = window.confirm('Delete this MOM row?')
+    if (!ok) return
+    updateProjectMomItems((current) => current.filter((item) => item.id !== itemId))
+  }
+  const copyMomItemToIssueList = (item: MomItem) => {
+    if (!projectName) return
+    const ok = window.confirm('Copy this row to Issue List?')
+    if (!ok) return
+    updateProjectIssues((current) => {
+      const nextId = current.reduce((max, issue) => Math.max(max, issue.id), 0) + 1
+      return [
+        ...current,
+        {
+          id: nextId,
+          status: '',
+          type: '',
+          issued_by: '',
+          issue: item.content,
+          due_date: item.due_date,
+          pic: item.pic,
+          created_on: activeMomHeader.date,
+          updated_on: '',
+          progress: item.remarks,
+        },
+      ]
+    })
+  }
 
   if (!dbReady) {
     return (
@@ -1281,19 +1849,59 @@ function App() {
     <main className="app">
       <header className="app-header">
         <div className="app-header-row">
-          <img className="app-logo" src={logoImg} alt="WBS Viewer" />
+          <div className="app-header-brand">
+            <img className="app-logo" src={logoImg} alt="WBS Viewer" />
+            <div className="app-menu-tabs" role="tablist" aria-label="Main menu">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeMenu === 'wbs'}
+                className={activeMenu === 'wbs' ? 'menu-tab menu-tab-active' : 'menu-tab'}
+                onClick={() => setActiveMenu('wbs')}
+              >
+                WBS
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeMenu === 'issues'}
+                className={activeMenu === 'issues' ? 'menu-tab menu-tab-active' : 'menu-tab'}
+                onClick={() => setActiveMenu('issues')}
+              >
+                Issue List
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeMenu === 'mom'}
+                className={activeMenu === 'mom' ? 'menu-tab menu-tab-active' : 'menu-tab'}
+                onClick={() => setActiveMenu('mom')}
+              >
+                MOM
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeMenu === 'system_overview'}
+                className={activeMenu === 'system_overview' ? 'menu-tab menu-tab-active' : 'menu-tab'}
+                onClick={() => setActiveMenu('system_overview')}
+              >
+                Overview
+              </button>
+            </div>
+          </div>
           <button
             type="button"
             className="export-btn"
             onClick={() => void exportExcel()}
-            disabled={!projectName || tasks.length === 0}
+            disabled={!projectName || activeMenu === 'mom' || (activeMenu === 'wbs' && tasks.length === 0)}
           >
             Export Excel
           </button>
         </div>
       </header>
 
-      <section className="board">
+      <section className={`board ${activeMenu === 'wbs' ? '' : 'section-hidden'}`}>
         <div className="board-project-bar">
           <div className="editor-project-block">
             <div className="editor-project-fields">
@@ -1637,8 +2245,531 @@ function App() {
       </section>
 
 
+      <section className={`issue-list-panel ${activeMenu === 'issues' ? '' : 'section-hidden'}`}>
+        <div className="issue-list-header">
+          <h2>Issue List</h2>
+          <TabHeaderProjectPickers
+            projectName={projectName}
+            onProjectNameChange={setProjectName}
+            companyFilter={companyFilter}
+            onCompanyFilterChange={setCompanyFilter}
+            filteredProjectNames={filteredProjectNames}
+            distinctCompaniesForFilter={distinctCompaniesForFilter}
+          />
+          <span className="wbs-current-project issue-current-project" title={wbsTreeHeaderCaption}>
+            {wbsTreeHeaderCaption}
+          </span>
+          <button type="button" onClick={addIssueRow} disabled={!projectName}>
+            Add Issue
+          </button>
+        </div>
+        <input
+          className="h-scroll-control"
+          type="range"
+          min={0}
+          max={Math.max(1, issueScrollMax)}
+          value={Math.min(issueScrollLeft, Math.max(1, issueScrollMax))}
+          onChange={(event) => {
+            const next = Number(event.target.value)
+            setIssueScrollLeft(next)
+            if (issueScrollRef.current) issueScrollRef.current.scrollLeft = next
+          }}
+          disabled={issueScrollMax <= 0}
+        />
+        <div
+          className="issue-list-table-wrap"
+          ref={issueScrollRef}
+          onScroll={() => {
+            const el = issueScrollRef.current
+            if (!el) return
+            setIssueScrollLeft(el.scrollLeft)
+          }}
+        >
+          <table className="issue-list-table">
+            <colgroup>
+              <col className="issue-col-no" />
+              <col className="issue-col-created" />
+              <col className="issue-col-status" />
+              <col className="issue-col-type" />
+              <col className="issue-col-submitter" />
+              <col className="issue-col-issue" />
+              <col className="issue-col-due" />
+              <col className="issue-col-pic" />
+              <col className="issue-col-progress" />
+              <col className="issue-col-actions" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>No</th>
+                <th className="issue-th-date issue-th-filter">
+                  <div className="issue-th-with-sort-and-filter">
+                    <button
+                      type="button"
+                      className="issue-th-sort-btn issue-th-sort-btn--center issue-th-sort-btn--inrow"
+                      onClick={() => toggleIssueDateSort('created_on')}
+                    >
+                      Created
+                      {issueDateSort?.key === 'created_on' ? (issueDateSort.dir === 'asc' ? ' ▲' : ' ▼') : ''}
+                    </button>
+                    <select
+                      className="issue-th-head-select"
+                      value={issueCreatedFilter}
+                      title={issueCreatedFilter || 'ALL'}
+                      onChange={(e) => setIssueCreatedFilter(e.target.value)}
+                    >
+                      <option value="">ALL</option>
+                      {issueCreatedOptions.map((d) => (
+                        <option key={d} value={d}>
+                          {d}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </th>
+                <th className="issue-th-filter">
+                  <div className="issue-th-with-filter">
+                    <span>Status</span>
+                    <select
+                      value={issueStatusFilter}
+                      title={issueStatusFilter || 'ALL'}
+                      onChange={(e) => setIssueStatusFilter(e.target.value)}
+                    >
+                      <option value="">ALL</option>
+                      <option value="Not Started">Not Started</option>
+                      <option value="In Process">In Process</option>
+                      <option value="Finished">Finished</option>
+                    </select>
+                  </div>
+                </th>
+                <th className="issue-th-filter">
+                  <div className="issue-th-with-filter">
+                    <span>Type</span>
+                    <select
+                      value={issueTypeFilter}
+                      title={issueTypeFilter || 'ALL'}
+                      onChange={(e) => setIssueTypeFilter(e.target.value)}
+                    >
+                      <option value="">ALL</option>
+                      {issueTypeOptions.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </th>
+                <th className="issue-th-filter">
+                  <div className="issue-th-with-filter">
+                    <span>Submit</span>
+                    <select
+                      value={issueSubmitterFilter}
+                      title={issueSubmitterFilter || 'ALL'}
+                      onChange={(e) => setIssueSubmitterFilter(e.target.value)}
+                    >
+                      <option value="">ALL</option>
+                      {issueSubmitterOptions.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </th>
+                <th>Issue</th>
+                <th className="issue-th-date issue-th-filter">
+                  <div className="issue-th-with-sort-and-filter">
+                    <button
+                      type="button"
+                      className="issue-th-sort-btn issue-th-sort-btn--center issue-th-sort-btn--inrow"
+                      onClick={() => toggleIssueDateSort('due_date')}
+                    >
+                      Due Date
+                      {issueDateSort?.key === 'due_date' ? (issueDateSort.dir === 'asc' ? ' ▲' : ' ▼') : ''}
+                    </button>
+                    <select
+                      className="issue-th-head-select"
+                      value={issueDueDateFilter}
+                      title={issueDueDateFilter || 'ALL'}
+                      onChange={(e) => setIssueDueDateFilter(e.target.value)}
+                    >
+                      <option value="">ALL</option>
+                      {issueDueDateOptions.map((d) => (
+                        <option key={d} value={d}>
+                          {d}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </th>
+                <th className="issue-th-filter">
+                  <div className="issue-th-with-filter">
+                    <span>PIC</span>
+                    <select
+                      value={issuePicFilter}
+                      title={issuePicFilter || 'ALL'}
+                      onChange={(e) => setIssuePicFilter(e.target.value)}
+                    >
+                      <option value="">ALL</option>
+                      {issuePicOptions.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </th>
+                <th>Progress</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {sortedFilteredIssues.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="issue-empty-row">
+                    {activeIssues.length === 0 ? 'No issues yet. Click Add Issue.' : 'No issues match current filters.'}
+                  </td>
+                </tr>
+              ) : (
+                sortedFilteredIssues.map((item, idx) => (
+                  <tr key={item.id} className={item.status === 'Finished' ? 'issue-row-finished' : ''}>
+                    <td>{idx + 1}</td>
+                    <td className="issue-td-date">
+                      <input
+                        type="date"
+                        className="issue-input-date"
+                        lang="en-CA"
+                        value={item.created_on}
+                        onChange={(e) => updateIssue(item.id, 'created_on', e.target.value)}
+                      />
+                    </td>
+                    <td>
+                      <select value={item.status} onChange={(e) => updateIssue(item.id, 'status', e.target.value)}>
+                        <option value="">Select...</option>
+                        <option value="Not Started">Not Started</option>
+                        <option value="In Process">In Process</option>
+                        <option value="Finished">Finished</option>
+                      </select>
+                    </td>
+                    <td>
+                      <input value={item.type} onChange={(e) => updateIssue(item.id, 'type', e.target.value)} />
+                    </td>
+                    <td>
+                      <input value={item.issued_by} onChange={(e) => updateIssue(item.id, 'issued_by', e.target.value)} />
+                    </td>
+                    <td className="issue-td-fill">
+                      <IssueMultilineTextarea
+                        className="issue-textarea-fill"
+                        value={item.issue}
+                        onChange={(e) => updateIssue(item.id, 'issue', e.target.value)}
+                      />
+                    </td>
+                    <td className="issue-td-date">
+                      <input
+                        type="date"
+                        className="issue-input-date"
+                        lang="en-CA"
+                        value={item.due_date}
+                        onChange={(e) => updateIssue(item.id, 'due_date', e.target.value)}
+                      />
+                    </td>
+                    <td>
+                      <input value={item.pic} onChange={(e) => updateIssue(item.id, 'pic', e.target.value)} />
+                    </td>
+                    <td className="issue-td-fill">
+                      <IssueMultilineTextarea
+                        className="issue-textarea-fill"
+                        value={item.progress}
+                        onChange={(e) => updateIssue(item.id, 'progress', e.target.value)}
+                      />
+                    </td>
+                    <td>
+                      <button type="button" className="danger" onClick={() => removeIssue(item.id)}>
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className={`mom-panel ${activeMenu === 'mom' ? '' : 'section-hidden'}`}>
+        <div className="mom-header">
+          <h2>MOM</h2>
+          <TabHeaderProjectPickers
+            projectName={projectName}
+            onProjectNameChange={setProjectName}
+            companyFilter={companyFilter}
+            onCompanyFilterChange={setCompanyFilter}
+            filteredProjectNames={filteredProjectNames}
+            distinctCompaniesForFilter={distinctCompaniesForFilter}
+          />
+          <span className="wbs-current-project issue-current-project" title={wbsTreeHeaderCaption}>
+            {wbsTreeHeaderCaption}
+          </span>
+          <div className="mom-doc-controls">
+            <button type="button" onClick={newMom} disabled={!projectName}>
+              New MOM
+            </button>
+            <label className="mom-date-select-wrap">
+              Date
+              <select
+                value={activeMomDoc?.id ?? ''}
+                onChange={(e) => {
+                  if (!projectName) return
+                  setSelectedMomIdByProject((current) => ({
+                    ...current,
+                    [projectName]: e.target.value ? Number(e.target.value) : null,
+                  }))
+                }}
+                disabled={!projectName || momDocs.length === 0}
+              >
+                {momDocs.length === 0 ? (
+                  <option value="">No MOM</option>
+                ) : (
+                  momDocs.map((doc) => (
+                    <option key={doc.id} value={doc.id}>
+                      {doc.header.date || '(No Date)'}
+                    </option>
+                  ))
+                )}
+              </select>
+            </label>
+          </div>
+        </div>
+        <div className="mom-header-fields">
+          <label>
+            Title
+            <input value={activeMomHeader.title} onChange={(e) => updateProjectMomHeader('title', e.target.value)} />
+          </label>
+          <label>
+            Date
+            <input type="date" value={activeMomHeader.date} onChange={(e) => updateProjectMomHeader('date', e.target.value)} />
+          </label>
+          <label>
+            Time
+            <input value={activeMomHeader.time} onChange={(e) => updateProjectMomHeader('time', e.target.value)} />
+          </label>
+          <label>
+            Attendance
+            <input
+              value={activeMomHeader.attendance}
+              onChange={(e) => updateProjectMomHeader('attendance', e.target.value)}
+            />
+          </label>
+          <label>
+            Location
+            <input value={activeMomHeader.location} onChange={(e) => updateProjectMomHeader('location', e.target.value)} />
+          </label>
+          <div className="mom-actions">
+            <button type="button" onClick={addMomRow} disabled={!projectName || !activeMomDoc}>
+              Add Row
+            </button>
+          </div>
+        </div>
+        <div className="mom-table-wrap">
+          <table className="mom-table">
+            <colgroup>
+              <col className="mom-col-no" />
+              <col className="mom-col-type" />
+              <col className="mom-col-content" />
+              <col className="mom-col-issue-no" />
+              <col className="mom-col-remarks" />
+              <col className="mom-col-pic" />
+              <col className="mom-col-due" />
+              <col className="mom-col-actions" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>No</th>
+                <th>Type</th>
+                <th>Topic</th>
+                <th>Issue List No</th>
+                <th>Content</th>
+                <th>PIC</th>
+                <th>Due Date</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {activeMomItems.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="mom-empty-row">
+                    No MOM rows yet. Click Add Row.
+                  </td>
+                </tr>
+              ) : (
+                activeMomItems.map((item, idx) => (
+                  <tr key={item.id} className={item.type === 'New Issue' ? 'mom-row-new' : ''}>
+                    <td>{idx + 1}</td>
+                    <td>
+                      <select value={item.type} onChange={(e) => updateMomItem(item.id, 'type', e.target.value)}>
+                        <option value="">Select...</option>
+                        <option value="New Issue">New Issue</option>
+                      </select>
+                    </td>
+                    <td>
+                      <IssueMultilineTextarea
+                        className="mom-textarea-auto"
+                        value={item.content}
+                        onChange={(e) => updateMomItem(item.id, 'content', e.target.value)}
+                      />
+                    </td>
+                    <td>
+                      <input
+                        value={item.issue_list_no}
+                        onChange={(e) => updateMomItem(item.id, 'issue_list_no', e.target.value)}
+                      />
+                    </td>
+                    <td>
+                      <IssueMultilineTextarea
+                        className="mom-textarea-auto"
+                        value={item.remarks}
+                        onChange={(e) => updateMomItem(item.id, 'remarks', e.target.value)}
+                      />
+                    </td>
+                    <td>
+                      <input value={item.pic} onChange={(e) => updateMomItem(item.id, 'pic', e.target.value)} />
+                    </td>
+                    <td>
+                      <input type="date" value={item.due_date} onChange={(e) => updateMomItem(item.id, 'due_date', e.target.value)} />
+                    </td>
+                    <td>
+                      <div className="mom-action-cell">
+                        <button type="button" className="danger" onClick={() => removeMomItem(item.id)}>
+                          Delete
+                        </button>
+                        {item.type === 'New Issue' ? (
+                          <button
+                            type="button"
+                            className="mom-copy-issue-btn"
+                            onClick={() => copyMomItemToIssueList(item)}
+                          >
+                            Copy to List
+                          </button>
+                        ) : null}
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className={`system-overview-panel ${activeMenu === 'system_overview' ? '' : 'section-hidden'}`}>
+        <div className="system-overview-header">
+          <h2>Overview</h2>
+          <TabHeaderProjectPickers
+            projectName={projectName}
+            onProjectNameChange={setProjectName}
+            companyFilter={companyFilter}
+            onCompanyFilterChange={setCompanyFilter}
+            filteredProjectNames={filteredProjectNames}
+            distinctCompaniesForFilter={distinctCompaniesForFilter}
+          />
+          <span className="wbs-current-project issue-current-project" title={wbsTreeHeaderCaption}>
+            {wbsTreeHeaderCaption}
+          </span>
+          <button type="button" onClick={addSystemOverviewItem} disabled={!projectName}>
+            Add Item
+          </button>
+        </div>
+        {activeSystemOverviewItems.length === 0 ? (
+          <div className="system-overview-empty">No items yet. Click Add Item.</div>
+        ) : (
+          <div className="system-overview-list">
+            {activeSystemOverviewItems.map((item, idx) => (
+              (() => {
+                const itemZoom = overviewImageZoomById[item.id] ?? 50
+                return (
+              <article className="system-overview-card" key={item.id}>
+                <div className="system-overview-card-head">
+                  <input
+                    type="text"
+                    className="system-overview-title-input"
+                    value={item.title}
+                    onChange={(event) => updateSystemOverviewItem(item.id, 'title', event.target.value)}
+                    placeholder={`Item ${idx + 1}`}
+                  />
+                  <div className="system-overview-card-actions">
+                    <button
+                      type="button"
+                      onClick={() => moveSystemOverviewItem(item.id, 'up')}
+                      disabled={idx === 0}
+                    >
+                      Up
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => moveSystemOverviewItem(item.id, 'down')}
+                      disabled={idx === activeSystemOverviewItems.length - 1}
+                    >
+                      Down
+                    </button>
+                    <button type="button" className="danger" onClick={() => removeSystemOverviewItem(item.id)}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                <div className="system-overview-image-block">
+                  <div className="system-overview-image-controls">
+                    <input
+                      id={`overview-image-input-${item.id}`}
+                      className="system-overview-file-input"
+                      type="file"
+                      accept="image/*"
+                      onChange={(event) => handleSystemOverviewImageSelect(item.id, event.target.files?.[0] ?? null)}
+                    />
+                    <label htmlFor={`overview-image-input-${item.id}`} className="system-overview-file-btn">
+                      Select Image
+                    </label>
+                    <div className="system-overview-zoom">
+                      <span>Zoom {itemZoom}%</span>
+                      <input
+                        type="range"
+                        min={50}
+                        max={200}
+                        step={10}
+                        value={itemZoom}
+                        onChange={(event) =>
+                          setOverviewImageZoomById((current) => ({ ...current, [item.id]: Number(event.target.value) }))
+                        }
+                        aria-label={`Overview image zoom for item ${idx + 1}`}
+                      />
+                    </div>
+                  </div>
+                  {item.image_data_url ? (
+                    <img
+                      src={item.image_data_url}
+                      alt={`System overview ${idx + 1}`}
+                      className="system-overview-image"
+                      style={{ width: `${itemZoom}%`, maxWidth: 'none', maxHeight: 'none' }}
+                    />
+                  ) : (
+                    <div className="system-overview-image-placeholder">No image uploaded</div>
+                  )}
+                </div>
+                <label className="system-overview-description">
+                  <IssueMultilineTextarea
+                    value={item.description}
+                    onChange={(event) => updateSystemOverviewItem(item.id, 'description', event.target.value)}
+                    placeholder="Write description for this image..."
+                  />
+                </label>
+              </article>
+                )
+              })()
+            ))}
+          </div>
+        )}
+      </section>
+
       {selectedTask && (
-        <section className="editor">
+        <section className={`editor ${activeMenu === 'wbs' ? '' : 'section-hidden'}`}>
           <h2>Progress Update</h2>
           <div className="actions">
             <button type="button" onClick={() => addTask(selectedTask.parent_id)}>
@@ -1710,7 +2841,7 @@ function App() {
                   disabled
                 >
                   <option value="Not Started">Not Started</option>
-                  <option value="On process">On process</option>
+                  <option value="In Process">In Process</option>
                   <option value="Finished">Finished</option>
                 </select>
               </label>

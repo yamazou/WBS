@@ -3,7 +3,18 @@
 // separate wasm file and works reliably in dev/preview.
 import initSqlJs from 'sql.js/dist/sql-asm.js'
 import type { Database } from 'sql.js'
-import { emptyProjectBundle, type ProjectBundle, type Task, type TaskStatus, type ZoomUnit } from '../wbsDefaults'
+import {
+  emptyProjectBundle,
+  type MomDocument,
+  type IssueItem,
+  type MomHeader,
+  type MomItem,
+  type ProjectBundle,
+  type SystemOverviewItem,
+  type Task,
+  type TaskStatus,
+  type ZoomUnit,
+} from '../wbsDefaults'
 
 /** Legacy single-blob import only (not shown as an app default). */
 const LEGACY_IMPORT_PROJECT_NAME = 'Imported Project'
@@ -116,10 +127,135 @@ function migrateProjectsPoDateColumn(db: Database) {
   }
 }
 
+function migrateProjectsIssuesColumn(db: Database) {
+  try {
+    const r = db.exec('PRAGMA table_info(projects)')
+    if (!r.length || !r[0].values.length) return
+    const colNames = r[0].values.map((row) => String((row as unknown[])[1]))
+    if (colNames.includes('issues_json')) return
+    db.run(`ALTER TABLE projects ADD COLUMN issues_json TEXT NOT NULL DEFAULT '[]'`)
+  } catch {
+    /* ignore */
+  }
+}
+
+function migrateProjectsSystemOverviewColumn(db: Database) {
+  try {
+    const r = db.exec('PRAGMA table_info(projects)')
+    if (!r.length || !r[0].values.length) return
+    const colNames = r[0].values.map((row) => String((row as unknown[])[1]))
+    if (colNames.includes('system_overview_json')) return
+    db.run(`ALTER TABLE projects ADD COLUMN system_overview_json TEXT NOT NULL DEFAULT '[]'`)
+  } catch {
+    /* ignore */
+  }
+}
+
+function migrateProjectsMomColumn(db: Database) {
+  try {
+    const r = db.exec('PRAGMA table_info(projects)')
+    if (!r.length || !r[0].values.length) return
+    const colNames = r[0].values.map((row) => String((row as unknown[])[1]))
+    if (colNames.includes('mom_json')) return
+    db.run(`ALTER TABLE projects ADD COLUMN mom_json TEXT NOT NULL DEFAULT '{}'`)
+  } catch {
+    try {
+      db.run(`ALTER TABLE projects ADD COLUMN mom_json TEXT`)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 function ensureSchema(db: Database) {
   db.exec(WBS_DDL)
   migrateProjectsPoDateColumn(db)
+  migrateProjectsIssuesColumn(db)
+  migrateProjectsSystemOverviewColumn(db)
+  migrateProjectsMomColumn(db)
   migrateTasksMhMdColumn(db)
+}
+
+function hasProjectsColumn(db: Database, columnName: string): boolean {
+  try {
+    const r = db.exec('PRAGMA table_info(projects)')
+    if (!r.length || !r[0].values.length) return false
+    const colNames = r[0].values.map((row) => String((row as unknown[])[1]))
+    return colNames.includes(columnName)
+  } catch {
+    return false
+  }
+}
+
+function normalizeIssues(raw: unknown): IssueItem[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item, idx) => {
+    const o = item && typeof item === 'object' ? (item as Record<string, unknown>) : {}
+    return {
+      id: Number(o.id ?? idx + 1),
+      status: String(o.status ?? ''),
+      type: String(o.type ?? ''),
+      issued_by: String(o.issued_by ?? ''),
+      issue: String(o.issue ?? ''),
+      due_date: String(o.due_date ?? ''),
+      pic: String(o.pic ?? ''),
+      created_on: String(o.created_on ?? ''),
+      updated_on: String(o.updated_on ?? ''),
+      progress: String(o.progress ?? ''),
+    }
+  })
+}
+
+function normalizeSystemOverview(raw: unknown): SystemOverviewItem[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item, idx) => {
+    const o = item && typeof item === 'object' ? (item as Record<string, unknown>) : {}
+    return {
+      id: Number(o.id ?? idx + 1),
+      title: String(o.title ?? ''),
+      image_data_url: String(o.image_data_url ?? ''),
+      description: String(o.description ?? ''),
+    }
+  })
+}
+
+function normalizeMomHeader(raw: unknown): MomHeader {
+  const o = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return {
+    title: String(o.title ?? ''),
+    date: String(o.date ?? ''),
+    time: String(o.time ?? ''),
+    attendance: String(o.attendance ?? ''),
+    location: String(o.location ?? ''),
+  }
+}
+
+function normalizeMomItems(raw: unknown): MomItem[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item, idx) => {
+    const o = item && typeof item === 'object' ? (item as Record<string, unknown>) : {}
+    return {
+      id: Number(o.id ?? idx + 1),
+      type: String(o.type ?? ''),
+      content: String(o.content ?? ''),
+      issue_list_no: String(o.issue_list_no ?? ''),
+      pic: String(o.pic ?? ''),
+      due_date: String(o.due_date ?? ''),
+      remarks: String(o.remarks ?? ''),
+    }
+  })
+}
+
+function normalizeMomDocuments(raw: unknown): MomDocument[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((doc, idx) => {
+    const o = doc && typeof doc === 'object' ? (doc as Record<string, unknown>) : {}
+    return {
+      id: Number(o.id ?? idx + 1),
+      header: normalizeMomHeader(o.header),
+      items: normalizeMomItems(o.items),
+    }
+  })
 }
 
 function projectCount(db: Database): number {
@@ -133,11 +269,60 @@ function normalizeEntry(raw: unknown, parseTasks: (s: string | null) => Task[]):
     return emptyProjectBundle(parseTasks(JSON.stringify(raw)))
   }
   if (raw && typeof raw === 'object' && 'tasks' in raw) {
-    const o = raw as { tasks?: unknown; company?: unknown; po_date?: unknown }
+    const o = raw as {
+      tasks?: unknown
+      company?: unknown
+      po_date?: unknown
+      issues?: unknown
+      system_overview?: unknown
+      mom_json?: unknown
+      mom_header?: unknown
+      mom_items?: unknown
+    }
+    const docsFromJson = (() => {
+      const mj = o.mom_json
+      if (!mj || typeof mj !== 'object') return []
+      const m = mj as { docs?: unknown; header?: unknown; items?: unknown }
+      const docs = normalizeMomDocuments(m.docs)
+      if (docs.length > 0) return docs
+      const legacyHeader = normalizeMomHeader(m.header)
+      const legacyItems = normalizeMomItems(m.items)
+      if (
+        legacyHeader.title ||
+        legacyHeader.date ||
+        legacyHeader.time ||
+        legacyHeader.attendance ||
+        legacyHeader.location ||
+        legacyItems.length
+      ) {
+        return [{ id: 1, header: legacyHeader, items: legacyItems }]
+      }
+      return []
+    })()
     return {
       tasks: parseTasks(JSON.stringify(o.tasks ?? [])),
       company: typeof o.company === 'string' ? o.company : '',
       po_date: typeof o.po_date === 'string' ? o.po_date : '',
+      issues: normalizeIssues(o.issues),
+      system_overview: normalizeSystemOverview(o.system_overview),
+      mom_documents:
+        docsFromJson.length > 0
+          ? docsFromJson
+          : (() => {
+              const legacyHeader = normalizeMomHeader(o.mom_header)
+              const legacyItems = normalizeMomItems(o.mom_items)
+              if (
+                legacyHeader.title ||
+                legacyHeader.date ||
+                legacyHeader.time ||
+                legacyHeader.attendance ||
+                legacyHeader.location ||
+                legacyItems.length
+              ) {
+                return [{ id: 1, header: legacyHeader, items: legacyItems }]
+              }
+              return []
+            })(),
     }
   }
   return null
@@ -208,7 +393,12 @@ function writeMeta(db: Database, key: string, value: string) {
 }
 
 function readSnapshotFromDb(db: Database): WbsPersistedSnapshot {
-  const projRes = db.exec('SELECT name, company, po_date FROM projects ORDER BY sort_order ASC, name ASC')
+  const hasMomJson = hasProjectsColumn(db, 'mom_json')
+  const projRes = db.exec(
+    hasMomJson
+      ? 'SELECT name, company, po_date, issues_json, system_overview_json, mom_json FROM projects ORDER BY sort_order ASC, name ASC'
+      : 'SELECT name, company, po_date, issues_json, system_overview_json FROM projects ORDER BY sort_order ASC, name ASC',
+  )
   const projects: Record<string, ProjectBundle> = {}
   const names: string[] = []
   if (projRes.length && projRes[0].values.length) {
@@ -216,6 +406,11 @@ function readSnapshotFromDb(db: Database): WbsPersistedSnapshot {
       const name = String(row[0])
       const company = String(row[1] ?? '')
       const poDate = String(row[2] ?? '')
+      const issuesJson = String(row[3] ?? '[]')
+      const systemOverviewJson = String(row[4] ?? '[]')
+      const momJson = String(
+        row[5] ?? '{"header":{"title":"","date":"","time":"","attendance":"","location":""},"items":[]}',
+      )
       names.push(name)
       const stmt = db.prepare(
         `SELECT id, name, parent_id, task_order, planned_start_date, planned_end_date, actual_start_date, actual_end_date, role, status, progress, mh_md
@@ -250,15 +445,63 @@ function readSnapshotFromDb(db: Database): WbsPersistedSnapshot {
           actual_end_date: String(actEnd ?? ''),
           role: String(role ?? ''),
           status:
-            status === 'Finished' || status === 'On process' || status === 'Not Started'
+            status === 'Finished' || status === 'Not Started'
               ? (status as TaskStatus)
+              : status === 'On process'
+                ? 'In Process'
+                : status === 'In Process'
+                  ? status
               : 'Not Started',
           progress: Number(progress ?? 0),
           mh_md: String(mhMd ?? ''),
         })
       }
       stmt.free()
-      projects[name] = { tasks, company, po_date: poDate }
+      let issues: IssueItem[] = []
+      let systemOverview: SystemOverviewItem[] = []
+      let momDocs: MomDocument[] = []
+      try {
+        issues = normalizeIssues(JSON.parse(issuesJson))
+      } catch {
+        issues = []
+      }
+      try {
+        systemOverview = normalizeSystemOverview(JSON.parse(systemOverviewJson))
+      } catch {
+        systemOverview = []
+      }
+      try {
+        const parsedMom = JSON.parse(momJson) as { header?: unknown; items?: unknown }
+        const docs = normalizeMomDocuments((parsedMom as { docs?: unknown }).docs)
+        if (docs.length > 0) {
+          momDocs = docs
+        } else {
+          const legacyHeader = normalizeMomHeader(parsedMom.header)
+          const legacyItems = normalizeMomItems(parsedMom.items)
+          if (
+            legacyHeader.title ||
+            legacyHeader.date ||
+            legacyHeader.time ||
+            legacyHeader.attendance ||
+            legacyHeader.location ||
+            legacyItems.length
+          ) {
+            momDocs = [{ id: 1, header: legacyHeader, items: legacyItems }]
+          } else {
+            momDocs = []
+          }
+        }
+      } catch {
+        momDocs = []
+      }
+      projects[name] = {
+        tasks,
+        company,
+        po_date: poDate,
+        issues,
+        system_overview: systemOverview,
+        mom_documents: momDocs,
+      }
     }
   }
 
@@ -281,15 +524,31 @@ function writeSnapshotToDb(db: Database, snap: WbsPersistedSnapshot) {
     db.run('DELETE FROM projects')
     db.run('DELETE FROM companies')
 
+    const hasMomJson = hasProjectsColumn(db, 'mom_json')
     const names = Object.keys(snap.projects)
     names.forEach((name, idx) => {
       const bundle = snap.projects[name]
-      db.run('INSERT INTO projects (name, company, po_date, sort_order) VALUES (?, ?, ?, ?)', [
-        name,
-        bundle.company ?? '',
-        bundle.po_date ?? '',
-        idx,
-      ])
+      if (hasMomJson) {
+        db.run(
+          'INSERT INTO projects (name, company, po_date, issues_json, system_overview_json, mom_json, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [
+            name,
+            bundle.company ?? '',
+            bundle.po_date ?? '',
+            JSON.stringify(bundle.issues ?? []),
+            JSON.stringify(bundle.system_overview ?? []),
+            JSON.stringify({
+            docs: bundle.mom_documents ?? [],
+            }),
+            idx,
+          ],
+        )
+      } else {
+        db.run(
+          'INSERT INTO projects (name, company, po_date, issues_json, system_overview_json, sort_order) VALUES (?, ?, ?, ?, ?, ?)',
+          [name, bundle.company ?? '', bundle.po_date ?? '', JSON.stringify(bundle.issues ?? []), JSON.stringify(bundle.system_overview ?? []), idx],
+        )
+      }
       const ins = db.prepare(
         `INSERT INTO tasks (project_name, id, name, parent_id, task_order, planned_start_date, planned_end_date, actual_start_date, actual_end_date, role, status, progress, mh_md)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

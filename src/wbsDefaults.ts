@@ -1,5 +1,48 @@
-export type TaskStatus = 'Not Started' | 'On process' | 'Finished'
+export type TaskStatus = 'Not Started' | 'In Process' | 'Finished'
 export type ZoomUnit = 'day' | 'week' | 'month'
+export type IssueItem = {
+  id: number
+  status: string
+  type: string
+  issued_by: string
+  issue: string
+  due_date: string
+  pic: string
+  created_on: string
+  updated_on: string
+  progress: string
+}
+
+export type SystemOverviewItem = {
+  id: number
+  title: string
+  image_data_url: string
+  description: string
+}
+
+export type MomHeader = {
+  title: string
+  date: string
+  time: string
+  attendance: string
+  location: string
+}
+
+export type MomItem = {
+  id: number
+  type: string
+  content: string
+  issue_list_no: string
+  pic: string
+  due_date: string
+  remarks: string
+}
+
+export type MomDocument = {
+  id: number
+  header: MomHeader
+  items: MomItem[]
+}
 
 export type Task = {
   id: number
@@ -22,10 +65,20 @@ export type ProjectBundle = {
   company: string
   /** ISO `YYYY-MM-DD` for PO Date (optional). */
   po_date: string
+  issues: IssueItem[]
+  system_overview: SystemOverviewItem[]
+  mom_documents: MomDocument[]
 }
 
 export function emptyProjectBundle(tasks: Task[] = []): ProjectBundle {
-  return { tasks, company: '', po_date: '' }
+  return {
+    tasks,
+    company: '',
+    po_date: '',
+    issues: [],
+    system_overview: [],
+    mom_documents: [],
+  }
 }
 
 export const initialTasks: Task[] = [
@@ -39,7 +92,7 @@ export const initialTasks: Task[] = [
     actual_start_date: '2026-05-01',
     actual_end_date: '',
     role: 'Internal',
-    status: 'On process',
+    status: 'In Process',
     progress: 35,
     mh_md: '',
   },
@@ -67,7 +120,7 @@ export const initialTasks: Task[] = [
     actual_start_date: '2026-05-07',
     actual_end_date: '',
     role: 'Internal',
-    status: 'On process',
+    status: 'In Process',
     progress: 60,
     mh_md: '',
   },
@@ -81,7 +134,7 @@ export const initialTasks: Task[] = [
     actual_start_date: '2026-05-14',
     actual_end_date: '',
     role: 'Internal',
-    status: 'On process',
+    status: 'In Process',
     progress: 40,
     mh_md: '',
   },

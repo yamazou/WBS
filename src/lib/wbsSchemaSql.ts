@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS projects (
   name TEXT PRIMARY KEY,
   company TEXT NOT NULL DEFAULT '',
   po_date TEXT NOT NULL DEFAULT '',
+  issues_json TEXT NOT NULL DEFAULT '[]',
+  system_overview_json TEXT NOT NULL DEFAULT '[]',
+  mom_json TEXT NOT NULL DEFAULT '{}',
   sort_order INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tasks (
