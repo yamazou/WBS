@@ -23,6 +23,27 @@ import { WBS_DDL } from './wbsSchemaSql'
 export const LEGACY_TASKS_STORAGE_KEY = 'wbs-gantt-tasks-v1'
 export const PROJECTS_STORAGE_KEY = 'wbs-gantt-projects-v1'
 export const ZOOM_STORAGE_KEY = 'wbs-gantt-zoom-v1'
+export const GANTT_UNIT_SCALE_STORAGE_KEY = 'wbs-gantt-unit-scale-v1'
+
+/** Timeline column width scale (%). Applied to Day/Week/Month unit pixel width. */
+export const GANTT_UNIT_SCALE_MIN = 40
+export const GANTT_UNIT_SCALE_MAX = 1000
+export const GANTT_UNIT_SCALE_DEFAULT = 100
+
+export function clampGanttUnitScale(n: number): number {
+  if (!Number.isFinite(n)) return GANTT_UNIT_SCALE_DEFAULT
+  return Math.min(GANTT_UNIT_SCALE_MAX, Math.max(GANTT_UNIT_SCALE_MIN, Math.round(n)))
+}
+
+export function readGanttUnitScaleFromLocalStorage(): number {
+  try {
+    const s = localStorage.getItem(GANTT_UNIT_SCALE_STORAGE_KEY)
+    if (s != null && s !== '') return clampGanttUnitScale(Number(s))
+  } catch {
+    /* ignore */
+  }
+  return GANTT_UNIT_SCALE_DEFAULT
+}
 
 /** `npm run dev` / `vite preview`: SQLite is stored at `<repo>/.wbs-data/wbs.db` (Vite middleware). */
 export const WBS_REPO_SQLITE_PATH = '.wbs-data/wbs.db'
@@ -92,6 +113,8 @@ export type WbsPersistedSnapshot = {
   selectedProjectName: string
   projects: Record<string, ProjectBundle>
   zoom: ZoomUnit
+  /** 100 = default; scales Gantt column pixel width (Day/Week/Month). */
+  ganttUnitScalePercent: number
 }
 
 let sqlModulePromise: ReturnType<typeof initSqlJs> | null = null
@@ -351,6 +374,7 @@ function migrateFromLocalStorage(db: Database, parseTasks: (s: string | null) =>
                 : names[0],
             projects: normalizedProjects,
             zoom: readZoomFromLocalStorage(),
+            ganttUnitScalePercent: readGanttUnitScaleFromLocalStorage(),
           })
           localStorage.removeItem(PROJECTS_STORAGE_KEY)
           return
@@ -366,6 +390,7 @@ function migrateFromLocalStorage(db: Database, parseTasks: (s: string | null) =>
     selectedProjectName: LEGACY_IMPORT_PROJECT_NAME,
     projects: { [LEGACY_IMPORT_PROJECT_NAME]: emptyProjectBundle(legacyTasks) },
     zoom: readZoomFromLocalStorage(),
+    ganttUnitScalePercent: readGanttUnitScaleFromLocalStorage(),
   })
   localStorage.removeItem(LEGACY_TASKS_STORAGE_KEY)
 }
@@ -513,7 +538,11 @@ function readSnapshotFromDb(db: Database): WbsPersistedSnapshot {
   const z = readMeta(db, 'zoom')
   const zoom: ZoomUnit = z === 'day' || z === 'week' || z === 'month' ? z : 'day'
 
-  return { selectedProjectName: selected, projects, zoom }
+  const scaleRaw = readMeta(db, 'gantt_unit_scale')
+  const ganttUnitScalePercent =
+    scaleRaw != null && scaleRaw !== '' ? clampGanttUnitScale(Number(scaleRaw)) : readGanttUnitScaleFromLocalStorage()
+
+  return { selectedProjectName: selected, projects, zoom, ganttUnitScalePercent }
 }
 
 function writeSnapshotToDb(db: Database, snap: WbsPersistedSnapshot) {
@@ -586,6 +615,7 @@ function writeSnapshotToDb(db: Database, snap: WbsPersistedSnapshot) {
 
     writeMeta(db, 'selected_project_name', snap.selectedProjectName)
     writeMeta(db, 'zoom', snap.zoom)
+    writeMeta(db, 'gantt_unit_scale', String(clampGanttUnitScale(snap.ganttUnitScalePercent)))
     writeMeta(db, 'schema_version', '1')
 
     db.run('COMMIT')
@@ -600,6 +630,7 @@ export function emptyDefaultSnapshot(): WbsPersistedSnapshot {
     selectedProjectName: '',
     projects: {},
     zoom: 'day',
+    ganttUnitScalePercent: GANTT_UNIT_SCALE_DEFAULT,
   }
 }
 
@@ -644,6 +675,7 @@ export async function openWbsSqlite(
       await savePersistedBytes(db.export())
       try {
         localStorage.setItem(ZOOM_STORAGE_KEY, snap.zoom)
+        localStorage.setItem(GANTT_UNIT_SCALE_STORAGE_KEY, String(clampGanttUnitScale(snap.ganttUnitScalePercent)))
       } catch {
         /* ignore quota */
       }

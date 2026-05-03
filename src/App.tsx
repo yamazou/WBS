@@ -15,7 +15,17 @@ import {
   type TaskStatus,
   type ZoomUnit,
 } from './wbsDefaults'
-import { emptyDefaultSnapshot, openWbsSqlite, ZOOM_STORAGE_KEY, type WbsDbApi } from './lib/wbsSqlite'
+import {
+  clampGanttUnitScale,
+  emptyDefaultSnapshot,
+  GANTT_UNIT_SCALE_MAX,
+  GANTT_UNIT_SCALE_MIN,
+  GANTT_UNIT_SCALE_STORAGE_KEY,
+  openWbsSqlite,
+  readGanttUnitScaleFromLocalStorage,
+  ZOOM_STORAGE_KEY,
+  type WbsDbApi,
+} from './lib/wbsSqlite'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const ZOOM_CONFIG: Record<ZoomUnit, { unitWidth: number; minWidth: number; label: string }> = {
@@ -109,20 +119,17 @@ function parseMhMdNumeric(value: string): number {
   return Number.isFinite(n) ? n : 0
 }
 
-/** `MH` / `MD` / unknown from free-text (used for parent rollup suffix). */
-function unitFromDisplayMhMd(s: string): 'MH' | 'MD' | null {
-  const t = String(s ?? '').trim()
-  if (!t) return null
-  if (/\bMH\b/i.test(t) || /man-?hours?/i.test(t)) return 'MH'
-  if (/\bMD\b/i.test(t)) return 'MD'
-  return null
+/** `10MH`, `10 MD`, `8.5md` のように数値＋MH/MD のみ（親への合計表示に使う）。 */
+const MH_MD_ROLLUP_STRICT = /^\s*(\d+(?:\.\d+)?)\s*(MH|MD)\s*$/i
+
+function isMhMdRollupFormat(s: string): boolean {
+  return MH_MD_ROLLUP_STRICT.test(String(s ?? '').trim())
 }
 
-/** If any child shows MH, parent rollup uses MH; else MD when any child shows MD; else MD. */
-function rollupMhMdUnit(effectiveChildren: Task[]): 'MH' | 'MD' {
-  if (effectiveChildren.some((c) => unitFromDisplayMhMd(c.mh_md ?? '') === 'MH')) return 'MH'
-  if (effectiveChildren.some((c) => unitFromDisplayMhMd(c.mh_md ?? '') === 'MD')) return 'MD'
-  return 'MD'
+function strictMhMdUnit(s: string): 'MH' | 'MD' | null {
+  const m = String(s ?? '').trim().match(MH_MD_ROLLUP_STRICT)
+  if (!m) return null
+  return m[2].toUpperCase() === 'MH' ? 'MH' : 'MD'
 }
 
 /** Display string for parent rollup from summed child values. */
@@ -271,7 +278,7 @@ function TabHeaderProjectPickers({
           onChange={(e) => onCompanyFilterChange(e.target.value)}
           aria-label="会社で絞り込み"
         >
-          <option value="">ALL</option>
+          <option value="">すべて</option>
           {distinctCompaniesForFilter.map((c) => (
             <option key={c} value={c}>
               {c}
@@ -411,6 +418,10 @@ function App() {
   const zoomRef = useRef(zoom)
   zoomRef.current = zoom
 
+  const [ganttUnitScalePercent, setGanttUnitScalePercent] = useState(() => readGanttUnitScaleFromLocalStorage())
+  const ganttUnitScaleRef = useRef(ganttUnitScalePercent)
+  ganttUnitScaleRef.current = ganttUnitScalePercent
+
   const updateTasks = (updater: (current: Task[]) => Task[]) => {
     setTasks((current) => {
       const next = updater(current)
@@ -456,6 +467,7 @@ function App() {
         }
         tasksBelongToProjectRef.current = snap.selectedProjectName
         setZoom(snap.zoom)
+        setGanttUnitScalePercent(snap.ganttUnitScalePercent)
       } catch (err) {
         console.error('SQLite init failed', err)
       } finally {
@@ -475,10 +487,11 @@ function App() {
         selectedProjectName: projectNameRef.current,
         projects: projectsRef.current,
         zoom: zoomRef.current,
+        ganttUnitScalePercent: ganttUnitScaleRef.current,
       }).catch((err) => console.error('[wbs] persistSnapshot failed', err))
     }, 150)
     return () => clearTimeout(handle)
-  }, [dbReady, projectName, projects, zoom])
+  }, [dbReady, projectName, projects, zoom, ganttUnitScalePercent])
 
   useEffect(() => {
     if (!dbReady) return
@@ -490,6 +503,7 @@ function App() {
           selectedProjectName: projectNameRef.current,
           projects: projectsRef.current,
           zoom: zoomRef.current,
+          ganttUnitScalePercent: ganttUnitScaleRef.current,
         })
         .catch((err) => console.error('[wbs] persist flush failed', err))
     }
@@ -504,6 +518,14 @@ function App() {
   useEffect(() => {
     localStorage.setItem(ZOOM_STORAGE_KEY, zoom)
   }, [zoom])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(GANTT_UNIT_SCALE_STORAGE_KEY, String(clampGanttUnitScale(ganttUnitScalePercent)))
+    } catch {
+      /* ignore */
+    }
+  }, [ganttUnitScalePercent])
 
   useEffect(() => {
     setProjectNameInput(projectName)
@@ -606,14 +628,27 @@ function App() {
       const hasProcess = effectiveChildren.some((child) => child.status === 'In Process')
       const hasNotStarted = effectiveChildren.some((child) => child.status === 'Not Started')
       const status: TaskStatus = average >= 100 ? 'Finished' : hasProcess || !hasNotStarted ? 'In Process' : 'Not Started'
-      const sumMhMd = effectiveChildren.reduce((sum, child) => sum + parseMhMdNumeric(child.mh_md ?? ''), 0)
-      const mhMdUnit = rollupMhMdUnit(effectiveChildren)
+
+      const childrenWithMh = effectiveChildren.filter((c) => (c.mh_md ?? '').trim() !== '')
+      const allStrictRollupFormat =
+        childrenWithMh.length > 0 && childrenWithMh.every((c) => isMhMdRollupFormat(c.mh_md ?? ''))
+      const firstUnit = allStrictRollupFormat ? strictMhMdUnit(childrenWithMh[0].mh_md ?? '') : null
+      const uniformStrictUnit =
+        allStrictRollupFormat &&
+        firstUnit != null &&
+        childrenWithMh.every((c) => strictMhMdUnit(c.mh_md ?? '') === firstUnit)
+
+      let rolledMhMd = task.mh_md ?? ''
+      if (uniformStrictUnit && firstUnit) {
+        const sumMhMd = effectiveChildren.reduce((sum, child) => sum + parseMhMdNumeric(child.mh_md ?? ''), 0)
+        rolledMhMd = formatMhMdRollup(sumMhMd, firstUnit)
+      }
 
       const aggregated: Task = {
         ...task,
         progress: average,
         status,
-        mh_md: formatMhMdRollup(sumMhMd, mhMdUnit),
+        mh_md: rolledMhMd,
         // Keep parent schedule as the source of truth.
         // Only progress, status, and MH/MD rollup are auto-aggregated from children.
         planned_start_date: task.planned_start_date,
@@ -712,7 +747,10 @@ function App() {
   }, [effectiveTaskMap, tasks])
 
   const timelineMeta = useMemo(() => {
-    const { unitWidth, minWidth } = ZOOM_CONFIG[zoom]
+    const { unitWidth: baseUw, minWidth: baseMw } = ZOOM_CONFIG[zoom]
+    const s = clampGanttUnitScale(ganttUnitScalePercent) / 100
+    const unitWidth = Math.max(12, Math.round(baseUw * s))
+    const minWidth = Math.max(320, Math.round(baseMw * s))
 
     if (zoom === 'day') {
       const axisStart = toStartOfDay(minStart)
@@ -735,7 +773,7 @@ function App() {
     const months = (endDate.getFullYear() - startDate.getFullYear()) * 12 + (endDate.getMonth() - startDate.getMonth())
     const totalUnits = Math.max(1, months + 1)
     return { axisStart, totalUnits, unitWidth, minWidth }
-  }, [maxEnd, minStart, zoom])
+  }, [ganttUnitScalePercent, maxEnd, minStart, zoom])
 
   /** Pixel width of the date grid only (bars must use this, not minWidth stretch). */
   const timelineContentWidth = timelineMeta.totalUnits * timelineMeta.unitWidth
@@ -765,7 +803,7 @@ function App() {
       cancelAnimationFrame(rafId)
       window.removeEventListener('resize', syncScrollMeta)
     }
-  }, [activeMenu, projectName, projects, tasks, zoom, timelineContentWidth])
+  }, [activeMenu, ganttUnitScalePercent, projectName, projects, tasks, zoom, timelineContentWidth])
 
   const timelineTicks = useMemo(() => {
     if (zoom === 'day') {
@@ -967,13 +1005,22 @@ function App() {
     const rect = container.getBoundingClientRect()
     const threshold = 44
     const speed = 18
+    const canScrollPanel = container.scrollHeight > container.clientHeight + 2
 
     if (clientY < rect.top + threshold) {
-      container.scrollTop -= speed
-      syncVerticalScroll('left')
+      if (canScrollPanel) {
+        container.scrollTop -= speed
+        syncVerticalScroll('left')
+      } else {
+        window.scrollBy(0, -speed)
+      }
     } else if (clientY > rect.bottom - threshold) {
-      container.scrollTop += speed
-      syncVerticalScroll('left')
+      if (canScrollPanel) {
+        container.scrollTop += speed
+        syncVerticalScroll('left')
+      } else {
+        window.scrollBy(0, speed)
+      }
     }
   }
 
@@ -1048,6 +1095,7 @@ function App() {
           selectedProjectName: nextName,
           projects: nextProjects,
           zoom: zoomRef.current,
+          ganttUnitScalePercent: ganttUnitScaleRef.current,
         })
         .catch((err) => console.error('[wbs] persist after createProject failed', err))
     }
@@ -1179,6 +1227,7 @@ function App() {
           selectedProjectName: trimmed,
           projects: next,
           zoom: zoomRef.current,
+          ganttUnitScalePercent: ganttUnitScaleRef.current,
         })
         .catch((err) => console.error('[wbs] persist after project rename failed', err))
     }
@@ -1203,6 +1252,7 @@ function App() {
           selectedProjectName: nextName,
           projects: nextProjects,
           zoom: zoomRef.current,
+          ganttUnitScalePercent: ganttUnitScaleRef.current,
         })
         .catch((err) => console.error('[wbs] persist after deleteProject failed', err))
     }
@@ -1971,7 +2021,7 @@ function App() {
                       onChange={(event) => setCompanyFilter(event.target.value)}
                       aria-label="会社で絞り込み"
                     >
-                      <option value="">ALL</option>
+                      <option value="">すべて</option>
                       {distinctCompaniesForFilter.map((c) => (
                         <option key={c} value={c}>
                           {c}
@@ -2137,17 +2187,33 @@ function App() {
         <div className="panel panel-right">
           <div className="gantt-header-row">
             <h2>Gantt Chart</h2>
-            <div className="zoom-controls">
-              {(['day', 'week', 'month'] as ZoomUnit[]).map((unit) => (
-                <button
-                  key={unit}
-                  type="button"
-                  className={zoom === unit ? 'zoom-btn zoom-btn-active' : 'zoom-btn'}
-                  onClick={() => setZoom(unit)}
-                >
-                  {ZOOM_CONFIG[unit].label}
-                </button>
-              ))}
+            <div className="gantt-header-controls">
+              <div className="zoom-controls">
+                {(['day', 'week', 'month'] as ZoomUnit[]).map((unit) => (
+                  <button
+                    key={unit}
+                    type="button"
+                    className={zoom === unit ? 'zoom-btn zoom-btn-active' : 'zoom-btn'}
+                    onClick={() => setZoom(unit)}
+                  >
+                    {ZOOM_CONFIG[unit].label}
+                  </button>
+                ))}
+              </div>
+              <label className="gantt-unit-scale" title="タイムライン1列あたりの横幅（行の高さは固定です）">
+                <span className="gantt-unit-scale__label">列幅</span>
+                <input
+                  type="range"
+                  className="gantt-unit-scale__range"
+                  min={GANTT_UNIT_SCALE_MIN}
+                  max={GANTT_UNIT_SCALE_MAX}
+                  step={5}
+                  value={ganttUnitScalePercent}
+                  onChange={(e) => setGanttUnitScalePercent(clampGanttUnitScale(Number(e.target.value)))}
+                  aria-label="ガントの列幅スケール"
+                />
+                <span className="gantt-unit-scale__value">{ganttUnitScalePercent}%</span>
+              </label>
             </div>
           </div>
           <div
@@ -2823,7 +2889,11 @@ function App() {
                   placeholder="e.g. 8 MD"
                   maxLength={32}
                   disabled={hasChildren}
-                  title={hasChildren ? '親タスクの MH/MD は子タスクの合計です（編集は子で行ってください）' : undefined}
+                  title={
+                    hasChildren
+                      ? '子がすべて「数値+MH」または「数値+MD」（例: 10MH, 8.5 MD）のときだけ合計表示されます（編集は子で行ってください）'
+                      : undefined
+                  }
                 />
               </label>
               <label className="editor-field-role-narrow">

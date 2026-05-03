@@ -9,8 +9,8 @@
   --task-row-height: 40px;
   --header-row-height: 44px;
   --calendar-row-height: 50px;
-  --wbs-columns: 280px 110px 80px 118px 122px;
-  --wbs-grid-width: 762px;
+  /* Task column grows with content; WBS panel scrolls horizontally on .wbs-scroll */
+  --wbs-columns: minmax(280px, max-content) 110px 80px 118px 122px;
 }
 
 .app-header h1 {
@@ -983,11 +983,12 @@
 }
 
 .board-panel-scroll {
-  flex: 1;
+  flex: 0 0 auto;
   min-height: 0;
-  max-height: min(520px, 58vh);
-  overflow: auto;
-  overscroll-behavior: contain;
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: visible;
+  overscroll-behavior-x: contain;
   scrollbar-width: thin;
 }
 
@@ -1006,23 +1007,24 @@
 }
 
 .wbs-inner {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: var(--wbs-columns);
+  column-gap: 8px;
+  row-gap: 8px;
+  width: max-content;
   min-width: 100%;
+  box-sizing: border-box;
 }
 
 .wbs-column-header {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
   position: sticky;
   top: 0;
   z-index: 5;
-  width: var(--wbs-grid-width);
-  min-width: var(--wbs-grid-width);
   height: var(--calendar-row-height);
-  display: grid;
-  grid-template-columns: var(--wbs-columns);
   align-items: stretch;
-  gap: 8px;
   border: 1px solid #eceef3;
   border-radius: 8px;
   background: #f5fffa;
@@ -1052,8 +1054,10 @@
 }
 
 .wbs-rows-scrollable {
-  width: var(--wbs-grid-width);
-  min-width: var(--wbs-grid-width);
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  row-gap: 8px;
 }
 
 .gantt-rows-scrollable {
@@ -1099,16 +1103,11 @@ button.row:active {
 }
 
 .wbs-row {
+  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: var(--wbs-columns);
+  grid-template-columns: subgrid;
   align-items: center;
   justify-content: initial;
-}
-
-.wbs-row .task-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .role-cell,
@@ -1358,10 +1357,45 @@ button.row:active {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 0;
   min-height: var(--header-row-height);
   padding-bottom: 8px;
+}
+
+.gantt-header-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px 14px;
+}
+
+.gantt-unit-scale {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #475569;
+  white-space: nowrap;
+}
+
+.gantt-unit-scale__label {
+  flex: 0 0 auto;
+}
+
+.gantt-unit-scale__range {
+  width: min(140px, 28vw);
+  vertical-align: middle;
+}
+
+.gantt-unit-scale__value {
+  flex: 0 0 auto;
+  min-width: 2.75rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .zoom-controls {
