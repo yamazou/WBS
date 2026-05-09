@@ -17,17 +17,17 @@ import {
 } from './wbsDefaults'
 import {
   clampGanttUnitScale,
-  emptyDefaultSnapshot,
-  GANTT_UNIT_SCALE_MAX,
-  GANTT_UNIT_SCALE_MIN,
   GANTT_UNIT_SCALE_STORAGE_KEY,
-  openWbsSqlite,
   readGanttUnitScaleFromLocalStorage,
   ZOOM_STORAGE_KEY,
-  type WbsDbApi,
 } from './lib/wbsSqlite'
+import { emptyDefaultSnapshot, GANTT_UNIT_SCALE_MAX, GANTT_UNIT_SCALE_MIN } from './lib/wbsSqlite'
+import { openWbsSqlite, type WbsDbApi } from './lib/wbsSnapshotApi'
 
 const DAY_MS = 24 * 60 * 60 * 1000
+const WBS_TAB_EDIT_LOCK_KEY = 'wbs-tab-edit-lock-v1'
+const WBS_TAB_EDIT_LOCK_HEARTBEAT_MS = 2000
+const WBS_TAB_EDIT_LOCK_TTL_MS = 8000
 const ZOOM_CONFIG: Record<ZoomUnit, { unitWidth: number; minWidth: number; label: string }> = {
   day: { unitWidth: 34, minWidth: 720, label: 'Day' },
   week: { unitWidth: 56, minWidth: 720, label: 'Week' },
@@ -215,6 +215,26 @@ function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'r
       if (cancelled || !el.isConnected) return
       el.style.height = 'auto'
       el.style.height = `${el.scrollHeight}px`
+      if (document.activeElement === el) {
+        // Keep the editing field visible only when it grows below the visible area.
+        // Avoid upward auto-scroll that can feel jumpy while typing.
+        const scroller = (() => {
+          let p: HTMLElement | null = el.parentElement
+          while (p) {
+            const style = getComputedStyle(p)
+            const overflowY = style.overflowY
+            if (overflowY === 'auto' || overflowY === 'scroll') return p
+            p = p.parentElement
+          }
+          return null
+        })()
+        if (scroller) {
+          const elRect = el.getBoundingClientRect()
+          const scrollerRect = scroller.getBoundingClientRect()
+          const gap = elRect.bottom - scrollerRect.bottom
+          if (gap > 0) scroller.scrollTop += gap + 8
+        }
+      }
     }
     sync()
     requestAnimationFrame(() => {
@@ -358,8 +378,26 @@ function parseTasksJson(saved: string | null): Task[] {
 }
 
 function App() {
+  type TabEditLockPayload = { ownerId: string; ownerLabel: string; expiresAt: number }
+  const tabIdRef = useRef(
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  )
+  const tabLabelRef = useRef(`Tab-${tabIdRef.current.slice(0, 8)}`)
+  const [hasEditLock, setHasEditLock] = useState(true)
+  const [lockOwnerLabel, setLockOwnerLabel] = useState('')
   const wbsDbRef = useRef<WbsDbApi | null>(null)
   const [dbReady, setDbReady] = useState(false)
+  const [dbHydrated, setDbHydrated] = useState(false)
+  const [persistWarning, setPersistWarning] = useState('')
+  const [lastSavedAtLabel, setLastSavedAtLabel] = useState('')
+  const [retryingPersist, setRetryingPersist] = useState(false)
+  const [restoringBackup, setRestoringBackup] = useState(false)
+  const [loadingBackupDates, setLoadingBackupDates] = useState(false)
+  const [backupDates, setBackupDates] = useState<string[]>([])
+  const [selectedBackupDate, setSelectedBackupDate] = useState('')
+  const recoveringFromConflictRef = useRef(false)
 
   const [projectName, setProjectName] = useState<string>(mountSnapshot.selectedProjectName)
   const [projectNameInput, setProjectNameInput] = useState<string>(mountSnapshot.selectedProjectName)
@@ -422,6 +460,186 @@ function App() {
   const ganttUnitScaleRef = useRef(ganttUnitScalePercent)
   ganttUnitScaleRef.current = ganttUnitScalePercent
 
+  const markPersistSuccess = () => {
+    setPersistWarning('')
+    setLastSavedAtLabel(
+      new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    )
+  }
+
+  const persistCurrentSnapshot = async (context: string) => {
+    if (recoveringFromConflictRef.current) return false
+    if (!hasEditLock) {
+      setPersistWarning(
+        `別タブ(${lockOwnerLabel || '他タブ'})が編集中のため、このタブでは保存できません。編集タブを閉じるか、こちらを再読み込みしてください。`,
+      )
+      return false
+    }
+    const projectCount = Object.keys(projectsRef.current).length
+    if ((context === 'persistSnapshot' || context === 'persist flush') && projectCount === 0) {
+      return false
+    }
+    const api = wbsDbRef.current
+    if (!api) {
+      setPersistWarning('保存に失敗しました。ローカルDBへ同期できていません。')
+      return false
+    }
+    try {
+      await api.persistSnapshot({
+        selectedProjectName: projectNameRef.current,
+        projects: projectsRef.current,
+        zoom: zoomRef.current,
+        ganttUnitScalePercent: ganttUnitScaleRef.current,
+      })
+      markPersistSuccess()
+      return true
+    } catch (err) {
+      console.error(`[wbs] ${context} failed`, err)
+      const message = err instanceof Error ? err.message : String(err)
+      if (message.includes('HTTP 409') && !recoveringFromConflictRef.current) {
+        recoveringFromConflictRef.current = true
+        setPersistWarning('保存競合を検出しました。DBを再読込しています…')
+        setDbHydrated(false)
+        try {
+          const freshApi = await openWbsSqlite(parseTasksJson)
+          wbsDbRef.current?.close()
+          wbsDbRef.current = freshApi
+          const snap = freshApi.readSnapshot()
+          setProjectName(snap.selectedProjectName)
+          setProjectNameInput(snap.selectedProjectName)
+          setProjects(snap.projects)
+          const bundle =
+            snap.selectedProjectName && snap.projects[snap.selectedProjectName]
+              ? snap.projects[snap.selectedProjectName]
+              : null
+          setCompanyRenameInput(bundle?.company ?? '')
+          if (bundle?.tasks?.length) {
+            setTasks(bundle.tasks.map((task) => ({ ...task })))
+            setSelectedTaskId(bundle.tasks[0].id)
+          } else {
+            setTasks([])
+            setSelectedTaskId(0)
+          }
+          tasksBelongToProjectRef.current = snap.selectedProjectName
+          setZoom(snap.zoom)
+          setGanttUnitScalePercent(snap.ganttUnitScalePercent)
+          setDbHydrated(true)
+          setPersistWarning('保存競合のため最新DBを再読込しました。必要なら編集をやり直してください。')
+        } catch (reloadErr) {
+          console.error('[wbs] reload after conflict failed', reloadErr)
+          setPersistWarning('保存競合を検出しました。ページ再読み込み後に再試行してください。')
+        } finally {
+          recoveringFromConflictRef.current = false
+        }
+        return false
+      }
+      setPersistWarning('保存に失敗しました。ローカルDBへ同期できていません。')
+      return false
+    }
+  }
+
+  useEffect(() => {
+    const parseLock = (): TabEditLockPayload | null => {
+      try {
+        const raw = localStorage.getItem(WBS_TAB_EDIT_LOCK_KEY)
+        if (!raw) return null
+        const parsed = JSON.parse(raw) as Partial<TabEditLockPayload>
+        if (
+          typeof parsed.ownerId !== 'string' ||
+          typeof parsed.ownerLabel !== 'string' ||
+          typeof parsed.expiresAt !== 'number'
+        ) {
+          return null
+        }
+        return { ownerId: parsed.ownerId, ownerLabel: parsed.ownerLabel, expiresAt: parsed.expiresAt }
+      } catch {
+        return null
+      }
+    }
+
+    const writeLock = () => {
+      const payload: TabEditLockPayload = {
+        ownerId: tabIdRef.current,
+        ownerLabel: tabLabelRef.current,
+        expiresAt: Date.now() + WBS_TAB_EDIT_LOCK_TTL_MS,
+      }
+      localStorage.setItem(WBS_TAB_EDIT_LOCK_KEY, JSON.stringify(payload))
+      return payload
+    }
+
+    const releaseLock = () => {
+      const current = parseLock()
+      if (current?.ownerId === tabIdRef.current) {
+        localStorage.removeItem(WBS_TAB_EDIT_LOCK_KEY)
+      }
+    }
+
+    const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(WBS_TAB_EDIT_LOCK_KEY) : null
+    const announce = () => {
+      channel?.postMessage({ ts: Date.now() })
+    }
+
+    const refreshLockState = () => {
+      const current = parseLock()
+      const now = Date.now()
+      if (!current || current.expiresAt <= now || current.ownerId === tabIdRef.current) {
+        const own = writeLock()
+        setHasEditLock(true)
+        setLockOwnerLabel(own.ownerLabel)
+        setPersistWarning((prev) =>
+          prev.includes('別タブ') ? '' : prev,
+        )
+        announce()
+        return
+      }
+      setHasEditLock(false)
+      setLockOwnerLabel(current.ownerLabel)
+    }
+
+    refreshLockState()
+    const heartbeat = window.setInterval(() => {
+      const current = parseLock()
+      const now = Date.now()
+      if (!current || current.expiresAt <= now || current.ownerId === tabIdRef.current) {
+        writeLock()
+        setHasEditLock(true)
+        announce()
+      } else {
+        setHasEditLock(false)
+        setLockOwnerLabel(current.ownerLabel)
+      }
+    }, WBS_TAB_EDIT_LOCK_HEARTBEAT_MS)
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key && event.key !== WBS_TAB_EDIT_LOCK_KEY) return
+      refreshLockState()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refreshLockState()
+    }
+    const onPageHide = () => {
+      releaseLock()
+      announce()
+    }
+    const onChannelMessage = () => refreshLockState()
+
+    window.addEventListener('storage', onStorage)
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('pagehide', onPageHide)
+    channel?.addEventListener('message', onChannelMessage)
+
+    return () => {
+      window.clearInterval(heartbeat)
+      releaseLock()
+      announce()
+      window.removeEventListener('storage', onStorage)
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('pagehide', onPageHide)
+      channel?.removeEventListener('message', onChannelMessage)
+      channel?.close()
+    }
+  }, [])
+
   const updateTasks = (updater: (current: Task[]) => Task[]) => {
     setTasks((current) => {
       const next = updater(current)
@@ -447,7 +665,11 @@ function App() {
     ;(async () => {
       try {
         const api = await openWbsSqlite(parseTasksJson, ac.signal)
-        if (cancelled) return
+        if (cancelled) {
+          api.close()
+          return
+        }
+        wbsDbRef.current?.close()
         wbsDbRef.current = api
         const snap = api.readSnapshot()
         setProjectName(snap.selectedProjectName)
@@ -468,8 +690,11 @@ function App() {
         tasksBelongToProjectRef.current = snap.selectedProjectName
         setZoom(snap.zoom)
         setGanttUnitScalePercent(snap.ganttUnitScalePercent)
+        setDbHydrated(true)
       } catch (err) {
         console.error('SQLite init failed', err)
+        const detail = err instanceof Error ? err.message : String(err)
+        setPersistWarning(`ローカルDBの初期化に失敗しました（${detail}）。`)
       } finally {
         if (!cancelled) setDbReady(true)
       }
@@ -477,35 +702,23 @@ function App() {
     return () => {
       cancelled = true
       ac.abort()
+      wbsDbRef.current?.close()
+      wbsDbRef.current = null
     }
   }, [])
 
   useEffect(() => {
-    if (!dbReady || !wbsDbRef.current) return
+    if (!dbReady || !dbHydrated || !wbsDbRef.current || !hasEditLock) return
     const handle = setTimeout(() => {
-      void wbsDbRef.current!.persistSnapshot({
-        selectedProjectName: projectNameRef.current,
-        projects: projectsRef.current,
-        zoom: zoomRef.current,
-        ganttUnitScalePercent: ganttUnitScaleRef.current,
-      }).catch((err) => console.error('[wbs] persistSnapshot failed', err))
+      void persistCurrentSnapshot('persistSnapshot')
     }, 150)
     return () => clearTimeout(handle)
-  }, [dbReady, projectName, projects, zoom, ganttUnitScalePercent])
+  }, [dbReady, dbHydrated, hasEditLock, projectName, projects, zoom, ganttUnitScalePercent])
 
   useEffect(() => {
-    if (!dbReady) return
+    if (!dbReady || !dbHydrated || !hasEditLock) return
     const flush = () => {
-      const api = wbsDbRef.current
-      if (!api) return
-      void api
-        .persistSnapshot({
-          selectedProjectName: projectNameRef.current,
-          projects: projectsRef.current,
-          zoom: zoomRef.current,
-          ganttUnitScalePercent: ganttUnitScaleRef.current,
-        })
-        .catch((err) => console.error('[wbs] persist flush failed', err))
+      void persistCurrentSnapshot('persist flush')
     }
     window.addEventListener('pagehide', flush)
     window.addEventListener('beforeunload', flush)
@@ -513,7 +726,7 @@ function App() {
       window.removeEventListener('pagehide', flush)
       window.removeEventListener('beforeunload', flush)
     }
-  }, [dbReady])
+  }, [dbReady, dbHydrated, hasEditLock])
 
   useEffect(() => {
     localStorage.setItem(ZOOM_STORAGE_KEY, zoom)
@@ -708,11 +921,17 @@ function App() {
   }, [allProjectNames, companyFilter, projects])
 
   useLayoutEffect(() => {
-    if (!projectName) return
-    if (!filteredProjectNames.includes(projectName)) {
-      setProjectName(filteredProjectNames[0] ?? '')
+    if (!filteredProjectNames.length) {
+      if (companyFilter.trim() && allProjectNames.length > 0) {
+        setCompanyFilter('')
+      }
+      if (projectName) setProjectName('')
+      return
     }
-  }, [projectName, filteredProjectNames])
+    if (!projectName || !filteredProjectNames.includes(projectName)) {
+      setProjectName(filteredProjectNames[0])
+    }
+  }, [allProjectNames.length, companyFilter, filteredProjectNames, projectName])
 
   const canLevelUp = Boolean(selectedTask && selectedTask.parent_id !== null)
 
@@ -1056,7 +1275,7 @@ function App() {
         planned_end_date: baseEnd,
         actual_start_date: '',
         actual_end_date: '',
-        role: 'Internal',
+        role: '',
         status: 'Not Started',
         progress: 0,
         mh_md: '',
@@ -1090,14 +1309,7 @@ function App() {
     projectsRef.current = nextProjects
     projectNameRef.current = nextName
     if (wbsDbRef.current) {
-      void wbsDbRef.current
-        .persistSnapshot({
-          selectedProjectName: nextName,
-          projects: nextProjects,
-          zoom: zoomRef.current,
-          ganttUnitScalePercent: ganttUnitScaleRef.current,
-        })
-        .catch((err) => console.error('[wbs] persist after createProject failed', err))
+      void persistCurrentSnapshot('persist after createProject')
     }
   }
 
@@ -1222,14 +1434,7 @@ function App() {
     projectsRef.current = next
     projectNameRef.current = trimmed
     if (wbsDbRef.current) {
-      void wbsDbRef.current
-        .persistSnapshot({
-          selectedProjectName: trimmed,
-          projects: next,
-          zoom: zoomRef.current,
-          ganttUnitScalePercent: ganttUnitScaleRef.current,
-        })
-        .catch((err) => console.error('[wbs] persist after project rename failed', err))
+      void persistCurrentSnapshot('persist after project rename')
     }
   }
 
@@ -1247,16 +1452,62 @@ function App() {
     projectsRef.current = nextProjects
     projectNameRef.current = nextName
     if (wbsDbRef.current) {
-      void wbsDbRef.current
-        .persistSnapshot({
-          selectedProjectName: nextName,
-          projects: nextProjects,
-          zoom: zoomRef.current,
-          ganttUnitScalePercent: ganttUnitScaleRef.current,
-        })
-        .catch((err) => console.error('[wbs] persist after deleteProject failed', err))
+      void persistCurrentSnapshot('persist after deleteProject')
     }
   }
+
+  const loadBackupDates = async () => {
+    setLoadingBackupDates(true)
+    try {
+      const listRes = await fetch('/__wbs_sqlite/backups', { cache: 'no-store' })
+      if (!listRes.ok) {
+        throw new Error(`backup list HTTP ${listRes.status}`)
+      }
+      const payload = (await listRes.json()) as { dates?: unknown }
+      const dates = Array.isArray(payload.dates)
+        ? payload.dates.filter((d): d is string => typeof d === 'string')
+        : []
+      setBackupDates(dates)
+      setSelectedBackupDate((current) => (current && dates.includes(current) ? current : dates[0] ?? ''))
+    } catch (err) {
+      console.error('[wbs] backup date list failed', err)
+      setBackupDates([])
+      setSelectedBackupDate('')
+      window.alert('バックアップ日付一覧の取得に失敗しました。コンソールログを確認してください。')
+    } finally {
+      setLoadingBackupDates(false)
+    }
+  }
+
+  const recoverProjectsFromBackup = async () => {
+    if (restoringBackup) return
+    if (!selectedBackupDate) {
+      window.alert('復旧する日付を選択してください。')
+      return
+    }
+    const confirmed = window.confirm(
+      `${selectedBackupDate} のバックアップへ復旧します。現在のDBは上書きされます。続行しますか？`,
+    )
+    if (!confirmed) return
+    setRestoringBackup(true)
+    try {
+      const restoreRes = await fetch(`/__wbs_sqlite/restore?date=${encodeURIComponent(selectedBackupDate)}`, {
+        method: 'POST',
+      })
+      if (!restoreRes.ok) throw new Error(`restore HTTP ${restoreRes.status}`)
+      window.alert(`${selectedBackupDate} のバックアップに復旧しました。画面を再読み込みします。`)
+      window.location.reload()
+    } catch (err) {
+      console.error('[wbs] backup restore failed', err)
+      window.alert('バックアップ復旧に失敗しました。コンソールログを確認してください。')
+    } finally {
+      setRestoringBackup(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadBackupDates()
+  }, [])
 
   const removeTask = (taskId: number) => {
     updateTasks((current) => {
@@ -1480,11 +1731,74 @@ function App() {
       return
     }
 
+    if (activeMenu === 'mom') {
+      if (!activeMomDoc) return
+      const workbook = new ExcelJS.Workbook()
+      const sheet = workbook.addWorksheet('MOM')
+      const momHeaders = ['No', 'Type', 'Topic', 'Issue No', 'Content', 'PIC', 'Due Date']
+      const headerPairs: Array<[string, string]> = [
+        ['Title', activeMomHeader.title],
+        ['Date', activeMomHeader.date],
+        ['Time', activeMomHeader.time],
+        ['Attendance', activeMomHeader.attendance],
+        ['Location', activeMomHeader.location],
+      ]
+
+      headerPairs.forEach(([key, value]) => {
+        sheet.addRow([key, value ?? ''])
+      })
+      sheet.addRow([])
+      sheet.addRow(momHeaders)
+
+      activeMomItems.forEach((item, idx) => {
+        sheet.addRow([idx + 1, item.type, item.content, item.issue_list_no, item.remarks, item.pic, item.due_date])
+      })
+
+      const totalRows = sheet.rowCount
+      const totalCols = momHeaders.length
+      const tableStartRow = headerPairs.length + 2
+
+      for (let r = 1; r <= totalRows; r += 1) {
+        for (let c = 1; c <= totalCols; c += 1) {
+          const cell = sheet.getCell(r, c)
+          cell.font = { name: 'Meiryo UI', size: 10 }
+          if (r >= tableStartRow) {
+            cell.alignment = { vertical: 'top', horizontal: c === 3 || c === 5 ? 'left' : 'center', wrapText: true }
+            cell.border = {
+              top: { style: 'thin', color: { argb: 'FF4B5563' } },
+              left: { style: 'thin', color: { argb: 'FF4B5563' } },
+              bottom: { style: 'thin', color: { argb: 'FF4B5563' } },
+              right: { style: 'thin', color: { argb: 'FF4B5563' } },
+            }
+          } else {
+            cell.alignment = { vertical: 'middle', horizontal: c === 2 ? 'left' : 'center', wrapText: true }
+          }
+        }
+      }
+
+      sheet.getRow(tableStartRow).font = { name: 'Meiryo UI', size: 10, bold: true }
+      sheet.columns = [{ width: 6 }, { width: 18 }, { width: 44 }, { width: 16 }, { width: 44 }, { width: 18 }, { width: 14 }]
+
+      const safeDate = (activeMomHeader.date || '').trim() || 'undated'
+      const buffer = await workbook.xlsx.writeBuffer()
+      const blob = new Blob([buffer], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `mom-${safeDate}.xlsx`
+      anchor.click()
+      URL.revokeObjectURL(url)
+      return
+    }
+
     const wbsRows = taskRows.map(({ task, depth }) => {
       const effectiveTask = effectiveTaskMap.get(task.id) ?? task
+      const taskLabel = `${'    '.repeat(depth)}${task.name}`
       return {
         ID: task.id,
-        Task: task.name,
+        Task: taskLabel,
         Level: depth + 1,
         Role: effectiveTask.role,
         'MH/MD': effectiveTask.mh_md ?? '',
@@ -1596,7 +1910,7 @@ function App() {
       for (let c = 1; c <= totalCols; c += 1) {
         const cell = sheet.getCell(r, c)
         cell.font = { name: 'Meiryo UI', size: 10 }
-        cell.alignment = { vertical: 'middle', horizontal: 'center' }
+        cell.alignment = { vertical: 'middle', horizontal: c === 2 ? 'left' : 'center' }
         cell.border = {
           top: { style: 'thin', color: { argb: 'FF4B5563' } },
           left: { style: 'thin', color: { argb: 'FF4B5563' } },
@@ -1623,6 +1937,16 @@ function App() {
       }
     }
 
+    // Match WBS Tree colors for MH/MD text by task level.
+    // Level 1 (top): black, Level 2: blue, Level 3+: green.
+    for (let i = 0; i < wbsRows.length; i += 1) {
+      const excelRow = i + 3 // Row 1/2 are headers, Row 3 is first task.
+      const level = Number(wbsRows[i].Level) || 1
+      const colorArgb = level <= 1 ? 'FF0F172A' : level === 2 ? 'FF1D4ED8' : 'FF166534'
+      const mhMdCell = sheet.getCell(excelRow, 5) // MH/MD column.
+      mhMdCell.font = { ...(mhMdCell.font ?? {}), color: { argb: colorArgb } }
+    }
+
     sheet.columns.forEach((column) => {
       column.width = 14
     })
@@ -1635,7 +1959,8 @@ function App() {
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = 'wbs-gantt-export.xlsx'
+    const zoomLabel = zoom === 'day' ? 'daily' : zoom === 'week' ? 'weekly' : 'monthly'
+    anchor.download = `wbs-gantt-export-${zoomLabel}.xlsx`
     anchor.click()
     URL.revokeObjectURL(url)
   }
@@ -1788,6 +2113,19 @@ function App() {
     if (!ok) return
     updateProjectIssues((current) => current.filter((item) => item.id !== issueId))
   }
+  const moveIssue = (issueId: number, direction: 'up' | 'down') => {
+    updateProjectIssues((current) => {
+      const index = current.findIndex((item) => item.id === issueId)
+      if (index < 0) return current
+      const swapIndex = direction === 'up' ? index - 1 : index + 1
+      if (swapIndex < 0 || swapIndex >= current.length) return current
+      const next = [...current]
+      const temp = next[index]
+      next[index] = next[swapIndex]
+      next[swapIndex] = temp
+      return next
+    })
+  }
 
   const momDocs: MomDocument[] = projects[projectName]?.mom_documents ?? []
   const selectedMomId = projectName ? (selectedMomIdByProject[projectName] ?? null) : null
@@ -1837,6 +2175,18 @@ function App() {
       return { ...current, [projectName]: maxId }
     })
   }
+  const removeActiveMom = () => {
+    if (!projectName || !activeMomDoc) return
+    const targetDate = activeMomDoc.header.date || '日付未設定'
+    const ok = window.confirm(`選択中のMOM（${targetDate}）を削除しますか？`)
+    if (!ok) return
+    const nextDocs = momDocs.filter((doc) => doc.id !== activeMomDoc.id)
+    updateProjectMomDocs((current) => current.filter((doc) => doc.id !== activeMomDoc.id))
+    setSelectedMomIdByProject((current) => ({
+      ...current,
+      [projectName]: nextDocs.length > 0 ? nextDocs[0].id : null,
+    }))
+  }
   const updateProjectMomHeader = <K extends keyof MomHeader>(key: K, value: MomHeader[K]) => {
     if (!activeMomDoc) return
     updateProjectMomDocs((current) =>
@@ -1863,12 +2213,27 @@ function App() {
     if (!ok) return
     updateProjectMomItems((current) => current.filter((item) => item.id !== itemId))
   }
+  const moveMomItem = (itemId: number, direction: 'up' | 'down') => {
+    updateProjectMomItems((current) => {
+      const index = current.findIndex((item) => item.id === itemId)
+      if (index < 0) return current
+      const swapIndex = direction === 'up' ? index - 1 : index + 1
+      if (swapIndex < 0 || swapIndex >= current.length) return current
+      const next = [...current]
+      const temp = next[index]
+      next[index] = next[swapIndex]
+      next[swapIndex] = temp
+      return next
+    })
+  }
   const copyMomItemToIssueList = (item: MomItem) => {
     if (!projectName) return
     const ok = window.confirm('Copy this row to Issue List?')
     if (!ok) return
+    let createdIssueNo = ''
     updateProjectIssues((current) => {
       const nextId = current.reduce((max, issue) => Math.max(max, issue.id), 0) + 1
+      createdIssueNo = String(nextId)
       return [
         ...current,
         {
@@ -1885,6 +2250,9 @@ function App() {
         },
       ]
     })
+    if (createdIssueNo) {
+      updateMomItem(item.id, 'issue_list_no', createdIssueNo)
+    }
   }
 
   if (!dbReady) {
@@ -1914,20 +2282,20 @@ function App() {
               <button
                 type="button"
                 role="tab"
-                aria-selected={activeMenu === 'issues'}
-                className={activeMenu === 'issues' ? 'menu-tab menu-tab-active' : 'menu-tab'}
-                onClick={() => setActiveMenu('issues')}
-              >
-                Issue List
-              </button>
-              <button
-                type="button"
-                role="tab"
                 aria-selected={activeMenu === 'mom'}
                 className={activeMenu === 'mom' ? 'menu-tab menu-tab-active' : 'menu-tab'}
                 onClick={() => setActiveMenu('mom')}
               >
                 MOM
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeMenu === 'issues'}
+                className={activeMenu === 'issues' ? 'menu-tab menu-tab-active' : 'menu-tab'}
+                onClick={() => setActiveMenu('issues')}
+              >
+                Issue List
               </button>
               <button
                 type="button"
@@ -1944,12 +2312,31 @@ function App() {
             type="button"
             className="export-btn"
             onClick={() => void exportExcel()}
-            disabled={!projectName || activeMenu === 'mom' || (activeMenu === 'wbs' && tasks.length === 0)}
+            disabled={!projectName || (activeMenu === 'wbs' && tasks.length === 0) || (activeMenu === 'mom' && !activeMomDoc)}
           >
             Export Excel
           </button>
         </div>
       </header>
+      {persistWarning && (
+        <div className="persist-warning-banner" role="alert">
+          <span>{persistWarning}</span>
+          <button
+            type="button"
+            className="persist-retry-btn"
+            disabled={retryingPersist || !hasEditLock}
+            onClick={() => {
+              setRetryingPersist(true)
+              void persistCurrentSnapshot('manual retry').finally(() => setRetryingPersist(false))
+            }}
+          >
+            {retryingPersist ? '再試行中…' : '今すぐ再試行'}
+          </button>
+        </div>
+      )}
+      <div className="persist-status-line">
+        最終保存: <strong>{lastSavedAtLabel || '未保存'}</strong>
+      </div>
 
       <section className={`board ${activeMenu === 'wbs' ? '' : 'section-hidden'}`}>
         <div className="board-project-bar">
@@ -1986,21 +2373,54 @@ function App() {
                     />
                   </label>
                   <div className="editor-project-actions editor-project-actions--inline board-project-col-actions">
-                    <button
-                      type="button"
-                      onMouseDown={(event) => event.preventDefault()}
-                      onClick={createProject}
-                    >
-                      Add
-                    </button>
-                    <button
-                      type="button"
-                      className="danger"
-                      onClick={deleteProject}
-                      disabled={!projectName}
-                    >
-                      Delete
-                    </button>
+                    <div className="editor-project-actions-stack">
+                      <button
+                        type="button"
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={createProject}
+                      >
+                        Add
+                      </button>
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={deleteProject}
+                        disabled={!projectName}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                    <label className="board-project-col-company-narrow board-project-col-restore-date">
+                      <span className="editor-project-subfield-label">復旧日付</span>
+                      <select
+                        value={selectedBackupDate}
+                        onChange={(event) => setSelectedBackupDate(event.target.value)}
+                        disabled={loadingBackupDates || restoringBackup || backupDates.length === 0}
+                        aria-label="復旧日付"
+                      >
+                        {backupDates.length === 0 ? (
+                          <option value="">{loadingBackupDates ? '読込中…' : '候補なし'}</option>
+                        ) : (
+                          backupDates.map((d) => (
+                            <option key={d} value={d}>
+                              {d}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+                    <div className="editor-project-actions-stack">
+                      <button type="button" onClick={() => void loadBackupDates()} disabled={loadingBackupDates || restoringBackup}>
+                        {loadingBackupDates ? '更新中…' : '候補更新'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void recoverProjectsFromBackup()}
+                        disabled={restoringBackup || loadingBackupDates || !selectedBackupDate}
+                      >
+                        {restoringBackup ? '復旧中…' : '復旧'}
+                      </button>
+                    </div>
                   </div>
                   <label className="board-project-col-po-date">
                     <span className="editor-project-subfield-label">PO Date</span>
@@ -2047,23 +2467,25 @@ function App() {
                     />
                   </label>
                   <div className="editor-project-actions editor-project-actions--inline board-project-col-actions">
-                    <button
-                      type="button"
-                      onMouseDown={(event) => event.preventDefault()}
-                      onClick={addCompanyForProject}
-                      disabled={companyAddDisabled}
-                    >
-                      Add
-                    </button>
-                    <button
-                      type="button"
-                      className="danger"
-                      onMouseDown={(event) => event.preventDefault()}
-                      onClick={deleteCompanyForProject}
-                      disabled={companyDeleteDisabled}
-                    >
-                      Delete
-                    </button>
+                    <div className="editor-project-actions-stack">
+                      <button
+                        type="button"
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={addCompanyForProject}
+                        disabled={companyAddDisabled}
+                      >
+                        Add
+                      </button>
+                      <button
+                        type="button"
+                        className="danger"
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={deleteCompanyForProject}
+                        disabled={companyDeleteDisabled}
+                      >
+                        Delete
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -2142,7 +2564,10 @@ function App() {
                         {(effectiveTaskMap.get(task.id) ?? task).role}
                       </span>
                     </span>
-                    <span className="mh-md-cell" title={(effectiveTaskMap.get(task.id) ?? task).mh_md ?? ''}>
+                    <span
+                      className={`mh-md-cell mh-md-cell-level-${Math.min(depth, 2)}`}
+                      title={(effectiveTaskMap.get(task.id) ?? task).mh_md ?? ''}
+                    >
                       {(effectiveTaskMap.get(task.id) ?? task).mh_md?.trim() || '—'}
                     </span>
                     <span className="planned-end-cell">
@@ -2366,7 +2791,7 @@ function App() {
             </colgroup>
             <thead>
               <tr>
-                <th>No</th>
+                <th>Issue No</th>
                 <th className="issue-th-date issue-th-filter">
                   <div className="issue-th-with-sort-and-filter">
                     <button
@@ -2549,9 +2974,25 @@ function App() {
                       />
                     </td>
                     <td>
-                      <button type="button" className="danger" onClick={() => removeIssue(item.id)}>
-                        Delete
-                      </button>
+                      <div className="mom-action-cell">
+                        <button
+                          type="button"
+                          onClick={() => moveIssue(item.id, 'up')}
+                          disabled={activeIssues.findIndex((issue) => issue.id === item.id) <= 0}
+                        >
+                          Up
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => moveIssue(item.id, 'down')}
+                          disabled={activeIssues.findIndex((issue) => issue.id === item.id) >= activeIssues.length - 1}
+                        >
+                          Down
+                        </button>
+                        <button type="button" className="danger" onClick={() => removeIssue(item.id)}>
+                          Delete
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))
@@ -2578,6 +3019,9 @@ function App() {
           <div className="mom-doc-controls">
             <button type="button" onClick={newMom} disabled={!projectName}>
               New MOM
+            </button>
+            <button type="button" className="danger" onClick={removeActiveMom} disabled={!projectName || !activeMomDoc}>
+              Delete MOM
             </button>
             <label className="mom-date-select-wrap">
               Date
@@ -2652,7 +3096,7 @@ function App() {
                 <th>No</th>
                 <th>Type</th>
                 <th>Topic</th>
-                <th>Issue List No</th>
+                <th>Issue No</th>
                 <th>Content</th>
                 <th>PIC</th>
                 <th>Due Date</th>
@@ -2704,6 +3148,16 @@ function App() {
                     </td>
                     <td>
                       <div className="mom-action-cell">
+                        <button type="button" onClick={() => moveMomItem(item.id, 'up')} disabled={idx === 0}>
+                          Up
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => moveMomItem(item.id, 'down')}
+                          disabled={idx === activeMomItems.length - 1}
+                        >
+                          Down
+                        </button>
                         <button type="button" className="danger" onClick={() => removeMomItem(item.id)}>
                           Delete
                         </button>
@@ -2834,10 +3288,11 @@ function App() {
         )}
       </section>
 
-      {selectedTask && (
-        <section className={`editor ${activeMenu === 'wbs' ? '' : 'section-hidden'}`}>
-          <h2>Progress Update</h2>
-          <div className="actions">
+      <section className={`editor ${activeMenu === 'wbs' ? '' : 'section-hidden'}`}>
+        <h2>Progress Update</h2>
+        {selectedTask ? (
+          <>
+            <div className="actions">
             <button type="button" onClick={() => addTask(selectedTask.parent_id)}>
               Add Task
             </button>
@@ -2868,8 +3323,8 @@ function App() {
             >
               Delete
             </button>
-          </div>
-          <div className="editor-grid">
+            </div>
+            <div className="editor-grid">
             <div className="editor-task-fields-row">
               <label className="editor-field-task-name">
                 Task Name
@@ -2956,8 +3411,8 @@ function App() {
                 />
               </label>
             </div>
-          </div>
-          <label className="progress-editor">
+            </div>
+            <label className="progress-editor">
             Progress: {selectedTask.progress}%
             <input
               type="range"
@@ -2967,12 +3422,19 @@ function App() {
               onChange={(event) => updateTask(selectedTask.id, 'progress', Number(event.target.value))}
               disabled={hasChildren}
             />
-          </label>
-          {hasChildren ? (
-            <p className="hint">Parent task status/progress are auto-aggregated from child tasks.</p>
-          ) : null}
-        </section>
-      )}
+            </label>
+            {hasChildren ? (
+              <p className="hint">Parent task status/progress are auto-aggregated from child tasks.</p>
+            ) : null}
+          </>
+        ) : (
+          <div className="actions">
+            <button type="button" onClick={() => addTask(null)} disabled={!projectName}>
+              Add First Task
+            </button>
+          </div>
+        )}
+      </section>
 
       <footer className="app-footer">WBS Viewer v1.0 powered by PT.BAHTERA HISISTEM INDONESIA</footer>
     </main>

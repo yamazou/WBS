@@ -103,8 +103,14 @@ async function savePersistedBytes(data: Uint8Array): Promise<void> {
     keepalive: body.size <= 60_000,
   })
   if (r.status !== 204) {
+    let detail = ''
+    try {
+      detail = (await r.text()).trim()
+    } catch {
+      detail = ''
+    }
     throw new Error(
-      `[wbs] PUT ${REPO_FILE_API} failed (HTTP ${r.status}). Close apps locking ${WBS_REPO_SQLITE_PATH} and use npm run dev.`,
+      `[wbs] PUT ${REPO_FILE_API} failed (HTTP ${r.status})${detail ? `: ${detail}` : ''}. Close apps locking ${WBS_REPO_SQLITE_PATH} and use npm run dev.`,
     )
   }
 }
@@ -287,6 +293,36 @@ function projectCount(db: Database): number {
   return Number(r[0].values[0][0]) || 0
 }
 
+function projectNames(db: Database): string[] {
+  const r = db.exec('SELECT name FROM projects ORDER BY sort_order ASC, name ASC')
+  if (!r.length || !r[0].values.length) return []
+  return r[0].values.map((row) => String(row[0] ?? ''))
+}
+
+/**
+ * Historical fallback:
+ * If DB only has legacy `Imported Project` while richer multi-project data still remains in localStorage,
+ * re-run migration from localStorage to recover the full project list.
+ */
+function shouldBackfillFromProjectsStorage(db: Database): boolean {
+  let saved: string | null = null
+  try {
+    saved = localStorage.getItem(PROJECTS_STORAGE_KEY)
+  } catch {
+    return false
+  }
+  if (!saved) return false
+  try {
+    const parsed = JSON.parse(saved) as { projects?: Record<string, unknown> }
+    const lsProjects = parsed.projects && typeof parsed.projects === 'object' ? Object.keys(parsed.projects) : []
+    if (lsProjects.length === 0) return false
+  } catch {
+    return false
+  }
+  const names = projectNames(db)
+  return names.length === 1 && names[0] === LEGACY_IMPORT_PROJECT_NAME
+}
+
 function normalizeEntry(raw: unknown, parseTasks: (s: string | null) => Task[]): ProjectBundle | null {
   if (Array.isArray(raw)) {
     return emptyProjectBundle(parseTasks(JSON.stringify(raw)))
@@ -349,6 +385,34 @@ function normalizeEntry(raw: unknown, parseTasks: (s: string | null) => Task[]):
     }
   }
   return null
+}
+
+export function readLegacyProjectsFromLocalStorage(
+  parseTasks: (s: string | null) => Task[],
+): { selectedProjectName: string; projects: Record<string, ProjectBundle> } | null {
+  const saved = localStorage.getItem(PROJECTS_STORAGE_KEY)
+  if (!saved) return null
+  try {
+    const parsed = JSON.parse(saved) as {
+      selectedProjectName?: string
+      projects?: Record<string, unknown>
+    }
+    if (!parsed.projects || typeof parsed.projects !== 'object') return null
+    const normalizedProjects: Record<string, ProjectBundle> = {}
+    for (const [name, raw] of Object.entries(parsed.projects)) {
+      const bundle = normalizeEntry(raw, parseTasks)
+      if (bundle) normalizedProjects[name] = bundle
+    }
+    const names = Object.keys(normalizedProjects)
+    if (names.length === 0) return null
+    const selectedProjectName =
+      parsed.selectedProjectName && normalizedProjects[parsed.selectedProjectName]
+        ? parsed.selectedProjectName
+        : names[0]
+    return { selectedProjectName, projects: normalizedProjects }
+  } catch {
+    return null
+  }
 }
 
 function migrateFromLocalStorage(db: Database, parseTasks: (s: string | null) => Task[]) {
@@ -637,6 +701,7 @@ export function emptyDefaultSnapshot(): WbsPersistedSnapshot {
 export type WbsDbApi = {
   readSnapshot: () => WbsPersistedSnapshot
   persistSnapshot: (snap: WbsPersistedSnapshot) => Promise<void>
+  close: () => void
 }
 
 export async function openWbsSqlite(
@@ -649,7 +714,7 @@ export async function openWbsSqlite(
   const db = bytes && bytes.byteLength > 0 ? new SQL.Database(bytes) : new SQL.Database()
   ensureSchema(db)
 
-  if (projectCount(db) === 0) {
+  if (projectCount(db) === 0 || shouldBackfillFromProjectsStorage(db)) {
     migrateFromLocalStorage(db, parseTasks)
     if (projectCount(db) === 0) {
       writeSnapshotToDb(db, emptyDefaultSnapshot())
@@ -678,6 +743,13 @@ export async function openWbsSqlite(
         localStorage.setItem(GANTT_UNIT_SCALE_STORAGE_KEY, String(clampGanttUnitScale(snap.ganttUnitScalePercent)))
       } catch {
         /* ignore quota */
+      }
+    },
+    close: () => {
+      try {
+        db.close()
+      } catch {
+        /* ignore double-close */
       }
     },
   }

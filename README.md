@@ -1,73 +1,57 @@
-# React + TypeScript + Vite
+# WBS Viewer
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+WBS / MOM / Issue List / Overview をローカル環境で編集するアプリです。  
+フロントは React + Vite、データ保存先はローカル SQLite (`.wbs-data/wbs.db`) です。
 
-Currently, two official plugins are available:
+## 保存アーキテクチャ（現在）
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **ブラウザ内DBは使わない**
+  - 以前の `sql.js` ブラウザDB保存を廃止
+  - フロントは JSON スナップショットを送受信するのみ
+- **ローカルDBへ直接保存**
+  - `GET /__wbs_sqlite/snapshot`
+  - `PUT /__wbs_sqlite/snapshot`
+  - これらは Vite middleware (`vite.config.ts`) で処理
+- **DB実体**
+  - `.wbs-data/wbs.db`
 
-## React Compiler
+## バックアップ運用
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- バックアップ格納先: `.wbs-data/backups`
+- 形式: `wbs-YYYYMMDD-HHMMSS-SSS.db`
+- 保持: **10世代**
+- 作成間隔: **最短30分**
+- 復旧API: `POST /__wbs_sqlite/restore?date=...`
 
-## Expanding the ESLint configuration
+## 開発起動
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## 復旧手順（推奨）
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+1. WBSタブを1つだけにする（他は閉じる）
+2. `npm run dev` を再起動
+3. ブラウザで `Ctrl+F5`（ハードリロード）
+4. 画面の「復旧日付」から対象を選び「復旧」
+5. 再読み込みして Project 一覧を確認
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## 障害時チェック
+
+確認ファイル: `.wbs-data/backup.log`
+
+- `api.snapshot.get.fail`
+  - 起動時スナップショット読込失敗
+- `api.snapshot.put.blocked`
+  - 空スナップショット上書き防止で拒否（409）
+- `api.restore.ok`
+  - 復旧成功
+- `backup.create` / `backup.skip`
+  - バックアップ作成・スキップ状況
+
+## 補足
+
+- 起動直後に異常が出る場合は、まず `npm run dev` 再起動 + `Ctrl+F5` を実施してください。
+- バックアップDBが残っていれば、原則として復旧可能です。
