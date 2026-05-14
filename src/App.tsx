@@ -215,26 +215,6 @@ function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'r
       if (cancelled || !el.isConnected) return
       el.style.height = 'auto'
       el.style.height = `${el.scrollHeight}px`
-      if (document.activeElement === el) {
-        // Keep the editing field visible only when it grows below the visible area.
-        // Avoid upward auto-scroll that can feel jumpy while typing.
-        const scroller = (() => {
-          let p: HTMLElement | null = el.parentElement
-          while (p) {
-            const style = getComputedStyle(p)
-            const overflowY = style.overflowY
-            if (overflowY === 'auto' || overflowY === 'scroll') return p
-            p = p.parentElement
-          }
-          return null
-        })()
-        if (scroller) {
-          const elRect = el.getBoundingClientRect()
-          const scrollerRect = scroller.getBoundingClientRect()
-          const gap = elRect.bottom - scrollerRect.bottom
-          if (gap > 0) scroller.scrollTop += gap + 8
-        }
-      }
     }
     sync()
     requestAnimationFrame(() => {
