@@ -468,6 +468,10 @@ function wbsSqliteFileMiddleware(): Connect.NextHandleFunction {
             fs.mkdirSync(WBS_DATA_DIR, { recursive: true })
             backupCurrentDbIfExists()
             writeSnapshotViaNativeSqlite(WBS_DB_FILE, payload)
+            appendBackupLog('api.snapshot.put.ok', {
+              projects: incomingCount,
+              bytes: fs.statSync(WBS_DB_FILE).size,
+            })
             res.statusCode = 204
             res.end()
           } catch (e) {

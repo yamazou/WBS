@@ -210,6 +210,7 @@
 
 .mom-table-wrap {
   overflow: auto;
+  overflow-anchor: none;
 }
 
 .mom-table {
@@ -252,6 +253,7 @@
   min-height: 2.75em;
   height: auto;
   overflow-y: hidden;
+  overflow-anchor: none;
   line-height: 1.35;
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -582,6 +584,7 @@
   /* 横スクロールバーを常に確保（縦は必要時のみ） */
   overflow-x: scroll;
   overflow-y: auto;
+  overflow-anchor: none;
   scrollbar-gutter: stable;
   /* ヘッダー・余白を除き、画面下まで一覧が見えるように */
   height: calc(100dvh - 96px);
@@ -802,6 +805,7 @@
   min-height: 2.75em;
   height: auto;
   overflow-y: hidden;
+  overflow-anchor: none;
   border: none;
   border-radius: 0;
   padding: 8px;

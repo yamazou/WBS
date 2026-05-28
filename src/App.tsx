@@ -203,6 +203,16 @@ function sortedDistinctIssueIsoDates(issues: IssueItem[], key: 'created_on' | 'd
   })
 }
 
+function findVerticalScrollParent(el: HTMLElement): HTMLElement | null {
+  let parent: HTMLElement | null = el.parentElement
+  while (parent) {
+    const { overflowY } = getComputedStyle(parent)
+    if (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') return parent
+    parent = parent.parentElement
+  }
+  return null
+}
+
 /** Multiline fields: row height follows content. Re-syncs when tab leaves `display:none` (ResizeObserver) and after layout (rAF). */
 function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'rows'>) {
   const { className, onChange, value, ...rest } = props
@@ -213,8 +223,25 @@ function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'r
     let cancelled = false
     const sync = () => {
       if (cancelled || !el.isConnected) return
+      const scroller = findVerticalScrollParent(el)
+      const scrollTop = scroller?.scrollTop ?? 0
+      const scrollLeft = scroller?.scrollLeft ?? 0
+      const selStart = el.selectionStart
+      const selEnd = el.selectionEnd
       el.style.height = 'auto'
-      el.style.height = `${el.scrollHeight}px`
+      const nextHeight = el.scrollHeight
+      el.style.height = `${nextHeight}px`
+      if (scroller) {
+        scroller.scrollTop = scrollTop
+        scroller.scrollLeft = scrollLeft
+      }
+      if (document.activeElement === el) {
+        try {
+          el.setSelectionRange(selStart, selEnd)
+        } catch {
+          /* ignore if selection cannot be restored */
+        }
+      }
     }
     sync()
     requestAnimationFrame(() => {
@@ -368,6 +395,7 @@ function App() {
   const [hasEditLock, setHasEditLock] = useState(true)
   const [lockOwnerLabel, setLockOwnerLabel] = useState('')
   const wbsDbRef = useRef<WbsDbApi | null>(null)
+  const dbOpenGenRef = useRef(0)
   const [dbReady, setDbReady] = useState(false)
   const [dbHydrated, setDbHydrated] = useState(false)
   const [persistWarning, setPersistWarning] = useState('')
@@ -461,7 +489,10 @@ function App() {
     }
     const api = wbsDbRef.current
     if (!api) {
-      setPersistWarning('保存に失敗しました。ローカルDBへ同期できていません。')
+      if (!dbHydrated) return false
+      setPersistWarning(
+        '保存接続が切れました。`npm run dev` で起動しているか確認し、ページを再読み込み（Ctrl+F5）してから再試行してください。',
+      )
       return false
     }
     try {
@@ -513,7 +544,13 @@ function App() {
         }
         return false
       }
-      setPersistWarning('保存に失敗しました。ローカルDBへ同期できていません。')
+      if (message.includes('HTTP 404')) {
+        setPersistWarning(
+          '保存APIに接続できません。`npm run dev` で起動しているか確認してください（ビルド済みHTMLの直接開きでは保存できません）。',
+        )
+      } else {
+        setPersistWarning(`保存に失敗しました（${message}）。npm run dev 起動中か、別タブで編集中でないか確認してください。`)
+      }
       return false
     }
   }
@@ -641,11 +678,13 @@ function App() {
 
   useEffect(() => {
     const ac = new AbortController()
+    const openGen = ++dbOpenGenRef.current
     let cancelled = false
+    setDbHydrated(false)
     ;(async () => {
       try {
         const api = await openWbsSqlite(parseTasksJson, ac.signal)
-        if (cancelled) {
+        if (cancelled || openGen !== dbOpenGenRef.current) {
           api.close()
           return
         }
@@ -676,20 +715,24 @@ function App() {
         const detail = err instanceof Error ? err.message : String(err)
         setPersistWarning(`ローカルDBの初期化に失敗しました（${detail}）。`)
       } finally {
-        if (!cancelled) setDbReady(true)
+        if (!cancelled && openGen === dbOpenGenRef.current) setDbReady(true)
       }
     })()
     return () => {
       cancelled = true
       ac.abort()
-      wbsDbRef.current?.close()
-      wbsDbRef.current = null
+      if (openGen === dbOpenGenRef.current) {
+        setDbHydrated(false)
+        wbsDbRef.current?.close()
+        wbsDbRef.current = null
+      }
     }
   }, [])
 
   useEffect(() => {
     if (!dbReady || !dbHydrated || !wbsDbRef.current || !hasEditLock) return
     const handle = setTimeout(() => {
+      if (!wbsDbRef.current || !dbHydrated) return
       void persistCurrentSnapshot('persistSnapshot')
     }, 150)
     return () => clearTimeout(handle)
