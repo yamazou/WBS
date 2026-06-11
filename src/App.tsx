@@ -207,16 +207,42 @@ function findVerticalScrollParent(el: HTMLElement): HTMLElement | null {
   let parent: HTMLElement | null = el.parentElement
   while (parent) {
     const { overflowY } = getComputedStyle(parent)
-    if (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') return parent
+    if (
+      (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
+      parent.scrollHeight > parent.clientHeight + 1
+    ) {
+      return parent
+    }
     parent = parent.parentElement
   }
   return null
 }
 
+function restoreScrollPosition(scroller: HTMLElement | null, scrollTop: number, scrollLeft: number) {
+  if (scroller) {
+    scroller.scrollTop = scrollTop
+    scroller.scrollLeft = scrollLeft
+    return
+  }
+  window.scrollTo(scrollLeft, scrollTop)
+}
+
 /** Multiline fields: row height follows content. Re-syncs when tab leaves `display:none` (ResizeObserver) and after layout (rAF). */
 function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'rows'>) {
-  const { className, onChange, value, ...rest } = props
+  const { className, onChange, onKeyDown, value, ...rest } = props
   const ref = useRef<HTMLTextAreaElement>(null)
+  const lockScrollAfterEnter = () => {
+    const el = ref.current
+    if (!el) return
+    const scroller = findVerticalScrollParent(el)
+    const scrollTop = scroller?.scrollTop ?? window.scrollY
+    const scrollLeft = scroller?.scrollLeft ?? window.scrollX
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        restoreScrollPosition(scroller, scrollTop, scrollLeft)
+      })
+    })
+  }
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
@@ -224,17 +250,14 @@ function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'r
     const sync = () => {
       if (cancelled || !el.isConnected) return
       const scroller = findVerticalScrollParent(el)
-      const scrollTop = scroller?.scrollTop ?? 0
-      const scrollLeft = scroller?.scrollLeft ?? 0
+      const scrollTop = scroller?.scrollTop ?? window.scrollY
+      const scrollLeft = scroller?.scrollLeft ?? window.scrollX
       const selStart = el.selectionStart
       const selEnd = el.selectionEnd
       el.style.height = 'auto'
       const nextHeight = el.scrollHeight
       el.style.height = `${nextHeight}px`
-      if (scroller) {
-        scroller.scrollTop = scrollTop
-        scroller.scrollLeft = scrollLeft
-      }
+      restoreScrollPosition(scroller, scrollTop, scrollLeft)
       if (document.activeElement === el) {
         try {
           el.setSelectionRange(selStart, selEnd)
@@ -265,6 +288,12 @@ function IssueMultilineTextarea(props: Omit<React.ComponentProps<'textarea'>, 'r
       className={className}
       value={value}
       onChange={onChange}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+          lockScrollAfterEnter()
+        }
+        onKeyDown?.(e)
+      }}
       {...rest}
     />
   )
