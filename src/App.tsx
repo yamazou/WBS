@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import './App.css'
 import logoImg from './assets/wbs-viewer-logo.png'
 import {
@@ -67,6 +67,10 @@ function getStatusClass(status: TaskStatus): string {
   if (status === 'Finished') return 'status-finished'
   if (status === 'In Process') return 'status-process'
   return 'status-not-started'
+}
+
+function getGanttBarLevelClass(depth: number): string {
+  return `gantt-bar-level-${Math.min(Math.max(0, depth), 5)}`
 }
 
 function getRoleClass(role: string): string {
@@ -368,6 +372,339 @@ const getWeekStart = (value: number) => {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate() + diff).getTime()
 }
 
+function formatTaskDate(value: number): string {
+  const d = new Date(value)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+type GanttDateField = 'planned' | 'actual'
+
+type GanttTimelineLayout = {
+  zoom: ZoomUnit
+  axisStart: number
+  unitWidth: number
+}
+
+function computeBarLayout(
+  startDate: string,
+  endDate: string,
+  layout: GanttTimelineLayout,
+): { left: string; width: string } | null {
+  const startTime = parseTaskDate(startDate)
+  const endTime = parseTaskDate(endDate)
+  if (startTime === null || endTime === null) return null
+
+  const { zoom, axisStart, unitWidth: uw } = layout
+  let startOffset = 0
+  let duration = 1
+
+  if (zoom === 'day') {
+    startOffset = Math.max(0, Math.floor((toStartOfDay(startTime) - axisStart) / DAY_MS))
+    duration = Math.max(1, Math.ceil((toStartOfDay(endTime) - toStartOfDay(startTime)) / DAY_MS) + 1)
+  } else if (zoom === 'week') {
+    startOffset = Math.max(0, Math.floor((getWeekStart(startTime) - axisStart) / (7 * DAY_MS)))
+    duration = Math.max(1, Math.ceil((toStartOfDay(endTime) - getWeekStart(startTime)) / (7 * DAY_MS)) + 1)
+  } else {
+    const startMonth = toStartOfMonth(startTime)
+    const endMonth = toStartOfMonth(endTime)
+    const axisDate = new Date(axisStart)
+    const startDateObj = new Date(startMonth)
+    const endDateObj = new Date(endMonth)
+    startOffset =
+      (startDateObj.getFullYear() - axisDate.getFullYear()) * 12 + (startDateObj.getMonth() - axisDate.getMonth())
+    duration =
+      (endDateObj.getFullYear() - startDateObj.getFullYear()) * 12 +
+      (endDateObj.getMonth() - startDateObj.getMonth()) +
+      1
+    startOffset = Math.max(0, startOffset)
+    duration = Math.max(1, duration)
+  }
+
+  return {
+    left: `${startOffset * uw}px`,
+    width: `${duration * uw}px`,
+  }
+}
+
+function shiftDateByPixelDelta(ts: number, pixelDelta: number, zoom: ZoomUnit, unitWidth: number): number {
+  if (zoom === 'month') {
+    return addMonths(ts, Math.round(pixelDelta / unitWidth))
+  }
+  const dayDelta =
+    zoom === 'day' ? Math.round(pixelDelta / unitWidth) : Math.round((pixelDelta / unitWidth) * 7)
+  return toStartOfDay(ts + dayDelta * DAY_MS)
+}
+
+function dateFromTrackPixel(
+  pixelX: number,
+  zoom: ZoomUnit,
+  axisStart: number,
+  unitWidth: number,
+): number {
+  const unitIndex = Math.max(0, Math.floor(pixelX / unitWidth))
+  if (zoom === 'day') return toStartOfDay(axisStart + unitIndex * DAY_MS)
+  if (zoom === 'week') return toStartOfDay(axisStart + unitIndex * 7 * DAY_MS)
+  return toStartOfMonth(addMonths(axisStart, unitIndex))
+}
+
+function clampDateRange(start: number, end: number): { start: number; end: number } {
+  if (start <= end) return { start, end }
+  return { start: end, end: start }
+}
+
+function inclusiveDaySpan(startTs: number, endTs: number): number {
+  return Math.max(1, Math.ceil((toStartOfDay(endTs) - toStartOfDay(startTs)) / DAY_MS) + 1)
+}
+
+/** Actual bar length vs planned bar length → progress %. */
+function progressFromActualVsPlanned(
+  actualStart: string,
+  actualEnd: string,
+  plannedStart: string,
+  plannedEnd: string,
+): number | null {
+  const aStart = parseTaskDate(actualStart)
+  const aEnd = parseTaskDate(actualEnd)
+  const pStart = parseTaskDate(plannedStart)
+  const pEnd = parseTaskDate(plannedEnd)
+  if (aStart === null || aEnd === null || pStart === null || pEnd === null) return null
+  const actualDays = inclusiveDaySpan(aStart, aEnd)
+  const plannedDays = inclusiveDaySpan(pStart, pEnd)
+  return Math.min(100, Math.max(0, Math.round((actualDays / plannedDays) * 100)))
+}
+
+function rollupActualDatesFromChildren(children: Task[]): { start: string; end: string } {
+  let minStart: number | null = null
+  let maxEnd: number | null = null
+  for (const child of children) {
+    const s = parseTaskDate(child.actual_start_date)
+    const e = parseTaskDate(child.actual_end_date)
+    if (s !== null) minStart = minStart === null ? toStartOfDay(s) : Math.min(minStart, toStartOfDay(s))
+    if (e !== null) maxEnd = maxEnd === null ? toStartOfDay(e) : Math.max(maxEnd, toStartOfDay(e))
+  }
+  return {
+    start: minStart !== null ? formatTaskDate(minStart) : '',
+    end: maxEnd !== null ? formatTaskDate(maxEnd) : '',
+  }
+}
+
+function spanOverlapsUnit(
+  unitStart: number,
+  unitEnd: number,
+  rangeStart: number | null,
+  rangeEnd: number | null,
+): boolean {
+  if (rangeStart === null || rangeEnd === null) return false
+  return unitStart <= rangeEnd && unitEnd >= rangeStart
+}
+
+type GanttDragMode = 'move' | 'resize-start' | 'resize-end' | 'create'
+
+function GanttDateTrack({
+  taskId,
+  kind,
+  startDate,
+  endDate,
+  barClassName,
+  trackClassName,
+  barStyle,
+  timeline,
+  disabled,
+  selected,
+  onSelect,
+  onUpdateRange,
+  onClearRange,
+  onQuickCreate,
+  children,
+  overlay,
+}: {
+  taskId: number
+  kind: GanttDateField
+  startDate: string
+  endDate: string
+  barClassName: string
+  trackClassName: string
+  barStyle: { left: string; width: string } | null
+  timeline: GanttTimelineLayout
+  disabled?: boolean
+  selected?: boolean
+  onSelect: (taskId: number) => void
+  onUpdateRange: (taskId: number, kind: GanttDateField, start: string, end: string) => void
+  onClearRange?: (taskId: number, kind: GanttDateField) => void
+  onQuickCreate?: (taskId: number, kind: GanttDateField) => void
+  children?: ReactNode
+  overlay?: ReactNode
+}) {
+  const trackRef = useRef<HTMLDivElement>(null)
+  const [previewStyle, setPreviewStyle] = useState<{ left: string; width: string } | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const suppressDoubleClickUntilRef = useRef(0)
+
+  const startTs = parseTaskDate(startDate)
+  const endTs = parseTaskDate(endDate)
+  const hasBar = barStyle !== null && startTs !== null && endTs !== null
+
+  const trackTitle =
+    kind === 'actual'
+      ? disabled
+        ? undefined
+        : hasBar
+          ? 'ダブルクリックで実績を削除 / ドラッグで移動・伸縮'
+          : 'ダブルクリックで計画から実績を作成 / ドラッグで期間を指定'
+      : disabled
+        ? undefined
+        : 'ドラッグで期間を作成 / バーをドラッグで移動・端で伸縮'
+
+  const beginPointerDrag = (mode: GanttDragMode, event: React.PointerEvent) => {
+    if (disabled) return
+    event.preventDefault()
+    event.stopPropagation()
+    onSelect(taskId)
+
+    const track = trackRef.current
+    if (!track) return
+
+    const dragState =
+      mode === 'create'
+        ? { mode, originX: event.clientX, originStart: 0, originEnd: 0 }
+        : startTs !== null && endTs !== null
+          ? { mode, originX: event.clientX, originStart: startTs, originEnd: endTs }
+          : null
+    if (!dragState) return
+
+    setDragging(true)
+
+    const markMoved = () => {
+      suppressDoubleClickUntilRef.current = Date.now() + 400
+    }
+
+    const onMove = (ev: PointerEvent) => {
+      if (dragState.mode === 'create') {
+        const rect = track.getBoundingClientRect()
+        const startPx = dragState.originX - rect.left
+        const endPx = ev.clientX - rect.left
+        if (Math.abs(endPx - startPx) > 2) markMoved()
+        const lo = Math.min(startPx, endPx)
+        const hi = Math.max(startPx, endPx)
+        const rangeStart = dateFromTrackPixel(lo, timeline.zoom, timeline.axisStart, timeline.unitWidth)
+        const rangeEnd = dateFromTrackPixel(
+          hi < lo + timeline.unitWidth * 0.5 ? lo : hi,
+          timeline.zoom,
+          timeline.axisStart,
+          timeline.unitWidth,
+        )
+        const range = clampDateRange(rangeStart, rangeEnd)
+        setPreviewStyle(
+          computeBarLayout(formatTaskDate(range.start), formatTaskDate(range.end), timeline),
+        )
+        return
+      }
+
+      const dx = ev.clientX - dragState.originX
+      if (Math.abs(dx) > 2) markMoved()
+      const { zoom, unitWidth } = timeline
+      let newStart = dragState.originStart
+      let newEnd = dragState.originEnd
+
+      if (dragState.mode === 'move') {
+        newStart = shiftDateByPixelDelta(dragState.originStart, dx, zoom, unitWidth)
+        newEnd = shiftDateByPixelDelta(dragState.originEnd, dx, zoom, unitWidth)
+      } else if (dragState.mode === 'resize-start') {
+        newStart = shiftDateByPixelDelta(dragState.originStart, dx, zoom, unitWidth)
+      } else {
+        newEnd = shiftDateByPixelDelta(dragState.originEnd, dx, zoom, unitWidth)
+      }
+
+      const range = clampDateRange(newStart, newEnd)
+      onUpdateRange(taskId, kind, formatTaskDate(range.start), formatTaskDate(range.end))
+    }
+
+    const onUp = (ev: PointerEvent) => {
+      if (dragState.mode === 'create') {
+        const rect = track.getBoundingClientRect()
+        const startPx = dragState.originX - rect.left
+        const endPx = ev.clientX - rect.left
+        const lo = Math.min(startPx, endPx)
+        const hi = Math.max(startPx, endPx)
+        const rangeStart = dateFromTrackPixel(lo, timeline.zoom, timeline.axisStart, timeline.unitWidth)
+        const rangeEnd = dateFromTrackPixel(
+          hi < lo + timeline.unitWidth * 0.5 ? lo : hi,
+          timeline.zoom,
+          timeline.axisStart,
+          timeline.unitWidth,
+        )
+        const range = clampDateRange(rangeStart, rangeEnd)
+        onUpdateRange(taskId, kind, formatTaskDate(range.start), formatTaskDate(range.end))
+      }
+
+      setPreviewStyle(null)
+      setDragging(false)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
+  const shouldIgnoreDoubleClick = () => Date.now() < suppressDoubleClickUntilRef.current
+
+  const handleTrackDoubleClick = (event: React.MouseEvent) => {
+    if (disabled || hasBar || shouldIgnoreDoubleClick()) return
+    if (kind !== 'actual' || !onQuickCreate) return
+    event.preventDefault()
+    event.stopPropagation()
+    onSelect(taskId)
+    onQuickCreate(taskId, kind)
+  }
+
+  const handleBarDoubleClick = (event: React.MouseEvent) => {
+    if (disabled || !hasBar || shouldIgnoreDoubleClick()) return
+    if (kind !== 'actual' || !onClearRange) return
+    event.preventDefault()
+    event.stopPropagation()
+    onSelect(taskId)
+    onClearRange(taskId, kind)
+  }
+
+  return (
+    <div
+      ref={trackRef}
+      className={`${trackClassName}${disabled ? '' : ' gantt-track--editable'}${dragging ? ' gantt-track--dragging' : ''}`}
+      title={trackTitle}
+      onPointerDown={!hasBar && !disabled ? (e) => beginPointerDrag('create', e) : undefined}
+      onDoubleClick={handleTrackDoubleClick}
+    >
+      {hasBar ? (
+        <div
+          className={`${barClassName} gantt-bar-interactive${selected ? ' gantt-bar-selected' : ''}${dragging ? ' gantt-bar--dragging' : ''}`}
+          style={barStyle ?? undefined}
+          onDoubleClick={handleBarDoubleClick}
+        >
+          <span
+            className="gantt-bar-handle gantt-bar-handle--start"
+            onPointerDown={(e) => beginPointerDrag('resize-start', e)}
+          />
+          <div className="gantt-bar-body" onPointerDown={(e) => beginPointerDrag('move', e)}>
+            {children}
+          </div>
+          <span
+            className="gantt-bar-handle gantt-bar-handle--end"
+            onPointerDown={(e) => beginPointerDrag('resize-end', e)}
+          />
+        </div>
+      ) : null}
+      {previewStyle ? (
+        <div className={`${barClassName} gantt-bar--preview`} style={previewStyle} />
+      ) : null}
+      {overlay}
+    </div>
+  )
+}
+
 const mountSnapshot = emptyDefaultSnapshot()
 
 function parseTasksJson(saved: string | null): Task[] {
@@ -454,7 +791,9 @@ function App() {
     null,
   )
   const wbsScrollRef = useRef<HTMLDivElement | null>(null)
+  const wbsHeaderScrollRef = useRef<HTMLDivElement | null>(null)
   const ganttScrollRef = useRef<HTMLDivElement | null>(null)
+  const ganttHeaderScrollRef = useRef<HTMLDivElement | null>(null)
   const issueScrollRef = useRef<HTMLDivElement | null>(null)
   const syncingScrollRef = useRef(false)
   const tasksBelongToProjectRef = useRef(mountSnapshot.selectedProjectName)
@@ -909,15 +1248,19 @@ function App() {
         rolledMhMd = formatMhMdRollup(sumMhMd, firstUnit)
       }
 
+      const rolledActual = rollupActualDatesFromChildren(effectiveChildren)
+      const hasOwnActual =
+        parseTaskDate(task.actual_start_date) !== null || parseTaskDate(task.actual_end_date) !== null
+
       const aggregated: Task = {
         ...task,
         progress: average,
         status,
         mh_md: rolledMhMd,
-        // Keep parent schedule as the source of truth.
-        // Only progress, status, and MH/MD rollup are auto-aggregated from children.
         planned_start_date: task.planned_start_date,
         planned_end_date: task.planned_end_date,
+        actual_start_date: hasOwnActual ? task.actual_start_date : rolledActual.start,
+        actual_end_date: hasOwnActual ? task.actual_end_date : rolledActual.end,
       }
       result.set(task.id, aggregated)
       return aggregated
@@ -1055,10 +1398,12 @@ function App() {
       const ganttEl = ganttScrollRef.current
       const issueEl = issueScrollRef.current
       if (wbsEl) {
+        if (wbsHeaderScrollRef.current) wbsHeaderScrollRef.current.scrollLeft = wbsEl.scrollLeft
         setWbsScrollLeft(wbsEl.scrollLeft)
         setWbsScrollMax(Math.max(0, wbsEl.scrollWidth - wbsEl.clientWidth))
       }
       if (ganttEl) {
+        if (ganttHeaderScrollRef.current) ganttHeaderScrollRef.current.scrollLeft = ganttEl.scrollLeft
         setGanttScrollLeft(ganttEl.scrollLeft)
         setGanttScrollMax(Math.max(0, ganttEl.scrollWidth - ganttEl.clientWidth))
       }
@@ -1310,6 +1655,18 @@ function App() {
     requestAnimationFrame(() => {
       syncingScrollRef.current = false
     })
+  }
+
+  const syncWbsHorizontalScroll = (scrollLeft: number) => {
+    if (wbsScrollRef.current) wbsScrollRef.current.scrollLeft = scrollLeft
+    if (wbsHeaderScrollRef.current) wbsHeaderScrollRef.current.scrollLeft = scrollLeft
+    setWbsScrollLeft(scrollLeft)
+  }
+
+  const syncGanttHorizontalScroll = (scrollLeft: number) => {
+    if (ganttScrollRef.current) ganttScrollRef.current.scrollLeft = scrollLeft
+    if (ganttHeaderScrollRef.current) ganttHeaderScrollRef.current.scrollLeft = scrollLeft
+    setGanttScrollLeft(scrollLeft)
   }
 
   const addTask = (parentId: number | null) => {
@@ -1605,40 +1962,97 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [selectedTask, tasks.length])
 
-  const getBarStyle = (startDate: string, endDate: string) => {
-    const startTime = parseTaskDate(startDate)
-    const endTime = parseTaskDate(endDate)
-    if (startTime === null || endTime === null) return null
+  const getBarStyle = (startDate: string, endDate: string) =>
+    computeBarLayout(startDate, endDate, {
+      zoom,
+      axisStart: timelineMeta.axisStart,
+      unitWidth: timelineMeta.unitWidth,
+    })
 
-    let startOffset = 0
-    let duration = 1
-
-    if (zoom === 'day') {
-      startOffset = Math.max(0, Math.floor((toStartOfDay(startTime) - timelineMeta.axisStart) / DAY_MS))
-      duration = Math.max(1, Math.ceil((toStartOfDay(endTime) - toStartOfDay(startTime)) / DAY_MS) + 1)
-    } else if (zoom === 'week') {
-      startOffset = Math.max(0, Math.floor((getWeekStart(startTime) - timelineMeta.axisStart) / (7 * DAY_MS)))
-      duration = Math.max(1, Math.ceil((toStartOfDay(endTime) - getWeekStart(startTime)) / (7 * DAY_MS)) + 1)
-    } else {
-      const startMonth = toStartOfMonth(startTime)
-      const endMonth = toStartOfMonth(endTime)
-      const axisDate = new Date(timelineMeta.axisStart)
-      const startDate = new Date(startMonth)
-      const endDate = new Date(endMonth)
-      startOffset =
-        (startDate.getFullYear() - axisDate.getFullYear()) * 12 + (startDate.getMonth() - axisDate.getMonth())
-      duration =
-        (endDate.getFullYear() - startDate.getFullYear()) * 12 + (endDate.getMonth() - startDate.getMonth()) + 1
-      startOffset = Math.max(0, startOffset)
-      duration = Math.max(1, duration)
-    }
-
-    const uw = timelineMeta.unitWidth
-    return {
-      left: `${startOffset * uw}px`,
-      width: `${duration * uw}px`,
-    }
+  const updateTaskDateRange = (taskId: number, kind: GanttDateField, start: string, end: string) => {
+    const startKey = kind === 'planned' ? 'planned_start_date' : 'actual_start_date'
+    const endKey = kind === 'planned' ? 'planned_end_date' : 'actual_end_date'
+    updateTasks((current) => {
+      const parentIds = new Set(
+        current.filter((task) => task.parent_id !== null).map((task) => task.parent_id as number),
+      )
+      return current.map((task) => {
+        if (task.id !== taskId) return task
+        let updated = { ...task, [startKey]: start, [endKey]: end }
+        if (kind === 'actual' && !parentIds.has(taskId)) {
+          const derived = progressFromActualVsPlanned(
+            start,
+            end,
+            task.planned_start_date,
+            task.planned_end_date,
+          )
+          if (derived !== null) {
+            updated = { ...updated, progress: derived }
+          }
+        }
+        if (parentIds.has(taskId)) return updated
+        return { ...updated, status: statusFromProgress(updated.progress) }
+      })
+    })
   }
+
+  const clearTaskDateRange = (taskId: number, kind: GanttDateField) => {
+    if (kind !== 'actual') return
+    updateTasks((current) => {
+      const parentIds = new Set(
+        current.filter((task) => task.parent_id !== null).map((task) => task.parent_id as number),
+      )
+      return current.map((task) => {
+        if (task.id !== taskId) return task
+        const updated = {
+          ...task,
+          actual_start_date: '',
+          actual_end_date: '',
+          ...(parentIds.has(taskId) ? {} : { progress: 0 }),
+        }
+        if (parentIds.has(taskId)) return updated
+        return { ...updated, status: statusFromProgress(0) }
+      })
+    })
+  }
+
+  const createTaskActualFromPlanned = (taskId: number) => {
+    updateTasks((current) => {
+      const parentIds = new Set(
+        current.filter((task) => task.parent_id !== null).map((task) => task.parent_id as number),
+      )
+      return current.map((task) => {
+        if (task.id !== taskId) return task
+        if (task.actual_start_date.trim() && task.actual_end_date.trim()) return task
+        const plannedStart = task.planned_start_date
+        const plannedEnd = task.planned_end_date
+        if (parseTaskDate(plannedStart) === null || parseTaskDate(plannedEnd) === null) return task
+        let updated = {
+          ...task,
+          actual_start_date: plannedStart,
+          actual_end_date: plannedEnd,
+        }
+        if (!parentIds.has(taskId)) {
+          const derived = progressFromActualVsPlanned(plannedStart, plannedEnd, plannedStart, plannedEnd)
+          updated = {
+            ...updated,
+            progress: derived ?? 100,
+            status: statusFromProgress(derived ?? 100),
+          }
+        }
+        return updated
+      })
+    })
+  }
+
+  const ganttTimelineLayout = useMemo(
+    () => ({
+      zoom,
+      axisStart: timelineMeta.axisStart,
+      unitWidth: timelineMeta.unitWidth,
+    }),
+    [timelineMeta.axisStart, timelineMeta.unitWidth, zoom],
+  )
 
   const exportExcel = async () => {
     if (!projectName) return
@@ -1849,9 +2263,7 @@ function App() {
       const effectiveTask = effectiveTaskMap.get(task.id) ?? task
       const taskLabel = `${'    '.repeat(depth)}${task.name}`
       return {
-        ID: task.id,
         Task: taskLabel,
-        Level: depth + 1,
         Role: effectiveTask.role,
         'MH/MD': effectiveTask.mh_md ?? '',
         'Planned Start': effectiveTask.planned_start_date,
@@ -1893,29 +2305,27 @@ function App() {
       const actualStartParsed = parseTaskDate(effectiveTask.actual_start_date)
       const actualEndParsed = parseTaskDate(effectiveTask.actual_end_date)
       const actualStart = actualStartParsed !== null ? toStartOfDay(actualStartParsed) : null
+      const hasActual = actualStart !== null
       const actualEnd =
         actualEndParsed !== null
           ? toStartOfDay(actualEndParsed) + DAY_MS - 1
-          : toStartOfDay(Date.now()) + DAY_MS - 1
+          : hasActual
+            ? toStartOfDay(Date.now()) + DAY_MS - 1
+            : null
 
-      const cells = unitBounds.map(({ start, end }) => {
-        const inPlanned = plannedStart !== null && plannedEnd !== null && start <= plannedEnd && end >= plannedStart
-        return inPlanned ? '@' : ''
-      })
-      const actualFlags = unitBounds.map(({ start, end }) => {
-        if (actualStart === null) return false
-        if (actualEnd < actualStart) return false
-        return start <= actualEnd && end >= actualStart
-      })
+      const cells = unitBounds.map(({ start, end }) =>
+        spanOverlapsUnit(start, end, plannedStart, plannedEnd) ? '@' : '',
+      )
+      const actualFlags = unitBounds.map(({ start, end }) =>
+        spanOverlapsUnit(start, end, actualStart, actualEnd),
+      )
 
       ganttAoA.push([effectiveTask.name, ...cells])
       actualFillFlags.push(actualFlags)
     }
 
     const wbsHeaders = [
-      'ID',
       'Task',
-      'Level',
       'Role',
       'MH/MD',
       'Planned Start',
@@ -1934,9 +2344,7 @@ function App() {
       const wbsRow = wbsRows[i]
       const ganttRow = ganttAoA[i + 2] ?? []
       combinedAoA.push([
-        wbsRow.ID,
         wbsRow.Task,
-        wbsRow.Level,
         wbsRow.Role,
         wbsRow['MH/MD'],
         wbsRow['Planned Start'],
@@ -1957,12 +2365,19 @@ function App() {
     const totalRows = combinedAoA.length
     const totalCols = Math.max(...combinedAoA.map((row) => row.length), 0)
 
+    const headerFill = {
+      type: 'pattern' as const,
+      pattern: 'solid' as const,
+      fgColor: { argb: 'FFD1D5DB' },
+    }
+
     // Apply borders only to the actual table range.
     for (let r = 1; r <= totalRows; r += 1) {
       for (let c = 1; c <= totalCols; c += 1) {
         const cell = sheet.getCell(r, c)
-        cell.font = { name: 'Meiryo UI', size: 10 }
-        cell.alignment = { vertical: 'middle', horizontal: c === 2 ? 'left' : 'center' }
+        const isHeaderRow = r <= 2
+        cell.font = { name: 'Meiryo UI', size: 10, bold: isHeaderRow && r === 1 }
+        cell.alignment = { vertical: 'middle', horizontal: c === 1 ? 'left' : 'center' }
         cell.border = {
           top: { style: 'thin', color: { argb: 'FF4B5563' } },
           left: { style: 'thin', color: { argb: 'FF4B5563' } },
@@ -1970,7 +2385,12 @@ function App() {
           right: { style: 'thin', color: { argb: 'FF4B5563' } },
         }
 
-        // Fill actual period cells (blue) in Gantt area.
+        if (isHeaderRow) {
+          cell.fill = headerFill
+          continue
+        }
+
+        // Fill actual period cells (dark blue) in Gantt area.
         const dataRowIndex = r - 3 // Row 3 is first task row.
         const ganttColOffset = c - (wbsHeaders.length + 1) // First gantt calendar column is after WBS columns.
         if (
@@ -1991,18 +2411,18 @@ function App() {
 
     // Match WBS Tree colors for MH/MD text by task level.
     // Level 1 (top): black, Level 2: blue, Level 3+: green.
-    for (let i = 0; i < wbsRows.length; i += 1) {
+    for (let i = 0; i < taskRows.length; i += 1) {
       const excelRow = i + 3 // Row 1/2 are headers, Row 3 is first task.
-      const level = Number(wbsRows[i].Level) || 1
+      const level = taskRows[i].depth + 1
       const colorArgb = level <= 1 ? 'FF0F172A' : level === 2 ? 'FF1D4ED8' : 'FF166534'
-      const mhMdCell = sheet.getCell(excelRow, 5) // MH/MD column.
+      const mhMdCell = sheet.getCell(excelRow, 3) // MH/MD column.
       mhMdCell.font = { ...(mhMdCell.font ?? {}), color: { argb: colorArgb } }
     }
 
     sheet.columns.forEach((column) => {
       column.width = 14
     })
-    sheet.getColumn(2).width = 24
+    sheet.getColumn(1).width = 24
 
     const buffer = await workbook.xlsx.writeBuffer()
     const blob = new Blob([buffer], {
@@ -2552,25 +2972,35 @@ function App() {
               {wbsTreeHeaderCaption}
             </span>
           </div>
-          <div
-            className="wbs-scroll board-panel-scroll"
-            ref={wbsScrollRef}
-            onScroll={() => {
-              const el = wbsScrollRef.current
-              if (!el) return
-              setWbsScrollLeft(el.scrollLeft)
-              syncVerticalScroll('left')
-            }}
-          >
-            <div className="wbs-inner">
-              <div className="wbs-column-header">
-                <span className="wbs-col-task">Task</span>
-                <span className="wbs-col-role">Role</span>
-                <span className="wbs-col-mh-md">MH/MD</span>
-                <span className="wbs-col-date">Planned End</span>
-                <span className="wbs-col-status">Status</span>
+          <div className="board-panel-viewport">
+            <div
+              className="wbs-scroll-header board-panel-header-scroll"
+              ref={wbsHeaderScrollRef}
+              aria-hidden
+            >
+              <div className="wbs-inner">
+                <div className="wbs-column-header">
+                  <span className="wbs-col-task">Task</span>
+                  <span className="wbs-col-role">Role</span>
+                  <span className="wbs-col-mh-md">MH/MD</span>
+                  <span className="wbs-col-date">Planned End</span>
+                  <span className="wbs-col-status">Status</span>
+                </div>
               </div>
-              <div className="rows rows-scrollable wbs-rows-scrollable">
+            </div>
+            <div
+              className="wbs-scroll board-panel-scroll"
+              ref={wbsScrollRef}
+              onScroll={() => {
+                const el = wbsScrollRef.current
+                if (!el) return
+                if (wbsHeaderScrollRef.current) wbsHeaderScrollRef.current.scrollLeft = el.scrollLeft
+                setWbsScrollLeft(el.scrollLeft)
+                syncVerticalScroll('left')
+              }}
+            >
+              <div className="wbs-inner">
+                <div className="rows rows-scrollable wbs-rows-scrollable">
                 {taskRows.map(({ task, depth }) => (
                   <button
                     key={task.id}
@@ -2643,6 +3073,7 @@ function App() {
               </div>
             </div>
           </div>
+          </div>
           <input
             className="h-scroll-control"
             type="range"
@@ -2650,9 +3081,7 @@ function App() {
             max={Math.max(1, wbsScrollMax)}
             value={Math.min(wbsScrollLeft, Math.max(1, wbsScrollMax))}
             onChange={(event) => {
-              const next = Number(event.target.value)
-              setWbsScrollLeft(next)
-              if (wbsScrollRef.current) wbsScrollRef.current.scrollLeft = next
+              syncWbsHorizontalScroll(Number(event.target.value))
             }}
             disabled={wbsScrollMax <= 0}
           />
@@ -2693,42 +3122,58 @@ function App() {
               </label>
             </div>
           </div>
-          <div
-            className="gantt-scroll board-panel-scroll"
-            ref={ganttScrollRef}
-            onScroll={() => {
-              const el = ganttScrollRef.current
-              if (!el) return
-              setGanttScrollLeft(el.scrollLeft)
-              syncVerticalScroll('right')
-            }}
-          >
+          <div className="board-panel-viewport">
             <div
-              className="gantt-inner"
-              style={{
-                width: `${timelineContentWidth}px`,
-                ['--unit-width' as string]: `${timelineMeta.unitWidth}px`,
+              className="gantt-scroll-header board-panel-header-scroll"
+              ref={ganttHeaderScrollRef}
+              aria-hidden
+            >
+              <div
+                className="gantt-inner"
+                style={{
+                  width: `${timelineContentWidth}px`,
+                  ['--unit-width' as string]: `${timelineMeta.unitWidth}px`,
+                }}
+              >
+                <div
+                  className="gantt-calendar"
+                  style={{
+                    gridAutoColumns: `${timelineMeta.unitWidth}px`,
+                  }}
+                >
+                  {timelineTicks.map((tick) => (
+                    <div key={tick.key} className={`gantt-day-cell${tick.isWeekend ? ' gantt-day-cell--weekend' : ''}`}>
+                      <span className="gantt-month-label">{tick.top}</span>
+                      <span className="gantt-day-label">{tick.bottom}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div
+              className="gantt-scroll board-panel-scroll"
+              ref={ganttScrollRef}
+              onScroll={() => {
+                const el = ganttScrollRef.current
+                if (!el) return
+                if (ganttHeaderScrollRef.current) ganttHeaderScrollRef.current.scrollLeft = el.scrollLeft
+                setGanttScrollLeft(el.scrollLeft)
+                syncVerticalScroll('right')
               }}
             >
               <div
-                className="gantt-calendar"
+                className="gantt-inner"
                 style={{
-                  gridAutoColumns: `${timelineMeta.unitWidth}px`,
+                  width: `${timelineContentWidth}px`,
+                  ['--unit-width' as string]: `${timelineMeta.unitWidth}px`,
                 }}
               >
-                {timelineTicks.map((tick) => (
-                  <div key={tick.key} className={`gantt-day-cell${tick.isWeekend ? ' gantt-day-cell--weekend' : ''}`}>
-                    <span className="gantt-month-label">{tick.top}</span>
-                    <span className="gantt-day-label">{tick.bottom}</span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="rows rows-scrollable gantt-rows-scrollable">
-                {taskRows.map(({ task }) => {
+                <div className="rows rows-scrollable gantt-rows-scrollable">
+                {taskRows.map(({ task, depth }) => {
                   const effectiveTask = effectiveTaskMap.get(task.id) ?? task
                   const mhTrim = (effectiveTask.mh_md ?? '').trim()
                   const plannedStyle = getBarStyle(effectiveTask.planned_start_date, effectiveTask.planned_end_date)
+                  const levelClass = getGanttBarLevelClass(depth)
                   return (
                     <div
                       key={task.id}
@@ -2736,36 +3181,53 @@ function App() {
                       className={`row gantt-row ${draggedTaskId === task.id ? 'gantt-row-dragging' : ''} ${dragOver?.targetId === task.id ? 'gantt-row-target' : ''}`}
                     >
                       <div className="gantt-row-bars">
-                        <div className="gantt-track gantt-track-planned">
-                          {plannedStyle ? (
-                            <>
-                              <div className="gantt-bar gantt-bar-planned" style={plannedStyle} />
-                              {mhTrim ? (
-                                <span className="gantt-mh-md-label" style={plannedStyle}>
-                                  {mhTrim}
-                                </span>
-                              ) : null}
-                            </>
-                          ) : null}
-                        </div>
-                        <div className="gantt-track">
-                          {(() => {
-                            const actualStyle = getBarStyle(effectiveTask.actual_start_date, effectiveTask.actual_end_date)
-                            if (!actualStyle) return null
-                            return (
-                              <div className={`gantt-bar ${getStatusClass(effectiveTask.status)}`} style={actualStyle}>
-                                <span className="gantt-progress" style={{ width: `${effectiveTask.progress}%` }} />
-                                <span className="gantt-label">{effectiveTask.progress}%</span>
-                              </div>
-                            )
-                          })()}
-                        </div>
+                        <GanttDateTrack
+                          taskId={task.id}
+                          kind="planned"
+                          startDate={task.planned_start_date}
+                          endDate={task.planned_end_date}
+                          barClassName={`gantt-bar gantt-bar-planned ${levelClass}`}
+                          trackClassName="gantt-track gantt-track-planned"
+                          barStyle={plannedStyle}
+                          timeline={ganttTimelineLayout}
+                          disabled={!hasEditLock}
+                          selected={selectedTaskId === task.id}
+                          onSelect={setSelectedTaskId}
+                          onUpdateRange={updateTaskDateRange}
+                          overlay={
+                            mhTrim && plannedStyle ? (
+                              <span className="gantt-mh-md-label" style={plannedStyle}>
+                                {mhTrim}
+                              </span>
+                            ) : null
+                          }
+                        />
+                        <GanttDateTrack
+                          taskId={task.id}
+                          kind="actual"
+                          startDate={effectiveTask.actual_start_date}
+                          endDate={effectiveTask.actual_end_date}
+                          barClassName={`gantt-bar ${levelClass}`}
+                          trackClassName="gantt-track"
+                          barStyle={getBarStyle(effectiveTask.actual_start_date, effectiveTask.actual_end_date)}
+                          timeline={ganttTimelineLayout}
+                          disabled={!hasEditLock}
+                          selected={selectedTaskId === task.id}
+                          onSelect={setSelectedTaskId}
+                          onUpdateRange={updateTaskDateRange}
+                          onClearRange={clearTaskDateRange}
+                          onQuickCreate={createTaskActualFromPlanned}
+                        >
+                          <span className="gantt-progress" style={{ width: `${effectiveTask.progress}%` }} />
+                          <span className="gantt-label">{effectiveTask.progress}%</span>
+                        </GanttDateTrack>
                       </div>
                     </div>
                   )
                 })}
               </div>
             </div>
+          </div>
           </div>
           <input
             className="h-scroll-control"
@@ -2774,9 +3236,7 @@ function App() {
             max={Math.max(1, ganttScrollMax)}
             value={Math.min(ganttScrollLeft, Math.max(1, ganttScrollMax))}
             onChange={(event) => {
-              const next = Number(event.target.value)
-              setGanttScrollLeft(next)
-              if (ganttScrollRef.current) ganttScrollRef.current.scrollLeft = next
+              syncGanttHorizontalScroll(Number(event.target.value))
             }}
             disabled={ganttScrollMax <= 0}
           />

@@ -11,6 +11,7 @@
   --calendar-row-height: 50px;
   /* Task column grows with content; WBS panel scrolls horizontally on .wbs-scroll */
   --wbs-columns: minmax(280px, max-content) 110px 80px 118px 122px;
+  --wbs-board-scroll-max-height: calc(100dvh - 320px);
 }
 
 .app-header h1 {
@@ -969,6 +970,26 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+}
+
+.board-panel-viewport {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.board-panel-header-scroll {
+  flex: 0 0 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.board-panel-header-scroll::-webkit-scrollbar {
+  display: none;
 }
 
 .panel {
@@ -1025,7 +1046,7 @@
   padding-right: 4px;
 }
 
-/* WBS / Gantt: vertical scroll lives on .board-panel-scroll; rows list is not a scrollport. */
+/* WBS / Gantt: column header + calendar stay fixed; task rows scroll inside .board-panel-scroll. */
 .wbs-rows-scrollable.rows-scrollable,
 .gantt-rows-scrollable.rows-scrollable {
   max-height: none;
@@ -1034,13 +1055,13 @@
 }
 
 .board-panel-scroll {
-  flex: 0 0 auto;
-  min-height: 0;
-  max-height: none;
-  overflow-x: auto;
-  overflow-y: visible;
-  overscroll-behavior-x: contain;
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: var(--wbs-board-scroll-max-height);
+  overflow: auto;
+  overscroll-behavior: contain;
   scrollbar-width: thin;
+  border-top: 1px solid #eceef3;
 }
 
 .wbs-scroll {
@@ -1071,8 +1092,6 @@
   grid-column: 1 / -1;
   display: grid;
   grid-template-columns: subgrid;
-  position: sticky;
-  top: 0;
   z-index: 5;
   height: var(--calendar-row-height);
   align-items: stretch;
@@ -1113,6 +1132,7 @@
 
 .gantt-rows-scrollable {
   padding-right: 0;
+  padding-top: 8px;
 }
 
 .row {
@@ -1487,16 +1507,17 @@ button.row:active {
 }
 
 .gantt-calendar {
-  position: sticky;
-  top: 0;
   z-index: 5;
   display: grid;
   grid-auto-flow: column;
-  margin-bottom: 8px;
   border: 1px solid #eceef3;
   border-radius: 8px;
   background: #f5fffa;
   box-shadow: 0 1px 0 rgba(15, 23, 42, 0.06);
+}
+
+.gantt-scroll-header .gantt-calendar {
+  margin-bottom: 0;
 }
 
 .gantt-day-cell {
@@ -1559,6 +1580,14 @@ button.row:active {
   );
 }
 
+.gantt-track--editable {
+  cursor: crosshair;
+}
+
+.gantt-track--dragging {
+  user-select: none;
+}
+
 .gantt-track-planned {
   height: 8px;
   background: #eef2f7;
@@ -1578,13 +1607,125 @@ button.row:active {
   justify-content: center;
   color: #fff;
   overflow: hidden;
+  touch-action: none;
+}
+
+.gantt-bar-interactive {
+  cursor: grab;
+}
+
+.gantt-bar-interactive.gantt-bar--dragging,
+.gantt-bar-interactive:active {
+  cursor: grabbing;
+}
+
+.gantt-bar-selected {
+  box-shadow: 0 0 0 2px #2563eb;
+  z-index: 2;
+}
+
+.gantt-bar-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+  z-index: 3;
+}
+
+.gantt-bar-handle--start {
+  left: 0;
+}
+
+.gantt-bar-handle--end {
+  right: 0;
+}
+
+.gantt-bar-handle:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.gantt-bar-planned .gantt-bar-handle:hover {
+  background: rgba(37, 99, 235, 0.2);
+}
+
+.gantt-bar-body {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+}
+
+.gantt-bar--preview {
+  opacity: 0.55;
+  pointer-events: none;
+  z-index: 1;
 }
 
 .gantt-bar-planned {
   top: 0;
   bottom: 0;
-  background: rgba(59, 130, 246, 0.35);
-  border: 1px dashed rgba(37, 99, 235, 0.7);
+  border-style: dashed;
+  border-width: 1px;
+}
+
+/* Planned bars: level tint (WBS depth 0 = root). */
+.gantt-bar-planned.gantt-bar-level-0 {
+  background: rgba(71, 85, 105, 0.38);
+  border-color: rgba(51, 65, 85, 0.85);
+}
+
+.gantt-bar-planned.gantt-bar-level-1 {
+  background: rgba(37, 99, 235, 0.35);
+  border-color: rgba(37, 99, 235, 0.75);
+}
+
+.gantt-bar-planned.gantt-bar-level-2 {
+  background: rgba(5, 150, 105, 0.35);
+  border-color: rgba(5, 150, 105, 0.75);
+}
+
+.gantt-bar-planned.gantt-bar-level-3 {
+  background: rgba(217, 119, 6, 0.35);
+  border-color: rgba(217, 119, 6, 0.78);
+}
+
+.gantt-bar-planned.gantt-bar-level-4 {
+  background: rgba(124, 58, 237, 0.35);
+  border-color: rgba(124, 58, 237, 0.75);
+}
+
+.gantt-bar-planned.gantt-bar-level-5 {
+  background: rgba(225, 29, 72, 0.32);
+  border-color: rgba(225, 29, 72, 0.75);
+}
+
+/* Actual bars: solid fill by WBS level. */
+.gantt-bar.gantt-bar-level-0 {
+  background: #64748b;
+}
+
+.gantt-bar.gantt-bar-level-1 {
+  background: #2563eb;
+}
+
+.gantt-bar.gantt-bar-level-2 {
+  background: #16a34a;
+}
+
+.gantt-bar.gantt-bar-level-3 {
+  background: #ea580c;
+}
+
+.gantt-bar.gantt-bar-level-4 {
+  background: #7c3aed;
+}
+
+.gantt-bar.gantt-bar-level-5 {
+  background: #e11d48;
 }
 
 .gantt-progress {
